@@ -1,0 +1,90 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# =========================
+# Virtual Environment
+# =========================
+venv/
+env/
+.venv/
+ENV/
+
+# =========================
+# VSCode / IDE
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Model weights
+# =========================
+*.pt
+*.pth
+*.ckpt
+models/
+checkpoints/
+
+# =========================
+# Dataset (rất quan trọng)
+# =========================
+data/
+datasets/
+*.zip
+*.tar
+*.gz
+
+# =========================
+# Outputs / Results
+# =========================
+outputs/
+results/
+*.png
+*.jpg
+*.jpeg
+*.csv
+
+# =========================
+# DQN replay buffer (nếu lưu file)
+# =========================
+buffer/
+memory/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Environment variables
+# =========================
+.env
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/

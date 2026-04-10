@@ -1,0 +1,304 @@
+# FedDRLPD v2 — Code Review & Upgrade Plan
+
+## 1. Tổng quan
+
+Bạn đang mô phỏng bài báo **"FedDRLPD: Deep Reinforcement Learning-Based Defense Mechanism against Poisoning Attacks in Federated Learning"** (Knowledge-Based Systems, 2026). Sau khi review toàn bộ code và so sánh với workflow Fig. 2 và Fig. 3, tôi phát hiện **12 vấn đề** cần sửa, chia thành 3 mức: **Critical**, **Important**, **Enhancement**.
+
+---
+
+## 2. Phân tích chi tiết theo workflow bài báo
+
+### Workflow theo Fig. 3 (đúng thứ tự):
+
+```
+Client Side:
+  ① DQN chọn benign users → action list A_t
+  ② Các clients được chọn train local model → w_i_t
+  ③ Tính malicious score: m_i_t = Att_ip * MD_i
+  ④ Gửi w_i_t và m_i_t về server
+
+Server Side:
+  ⑤ Aggregate global model: θ_t^g = θ_{t-1}^g + Σ (D_i / Σ D_j) * w_i_t
+  ⑥ Test accuracy: acc_t^g
+  ⑦ Cập nhật S_t = {w_i_t, n_i_t, m_i_t, acc_t^g}
+  ⑧ Tính reward R_t
+  ⑨ Lưu (S_t, A_t, R_t, S_{t+1}) vào replay buffer
+  ⑩ Train DQN neural network
+  ⑪ Broadcast global model → quay lại ①
+```
+
+---
+
+## 3. Các vấn đề phát hiện
+
+### 🔴 CRITICAL Issues
+
+---
+
+#### Issue #1: Aggregation sai công thức bài báo
+
+> [!CAUTION]
+> Aggregation hiện tại dùng **FedAvg thuần** (weighted average of absolute weights), nhưng bài báo dùng công thức **incremental update**:
+> `θ_t^g = θ_{t-1}^g + Σ (D_i / Σ D_j) * w_i_t`
+> Trong đó `w_i_t` là **delta weights** (weight update), KHÔNG phải absolute weights.
+
+**Hiện tại** ([server.py:160-183](file:///c:/CodePy/FedDRLPD_v2/server.py#L160-L183)):
+```python
+# Weighted average of ABSOLUTE weights → SAI
+new_weights[key] = Σ (data_size_i / total_data) * local_weights_i[key]
+```
+
+**Đúng theo bài báo**:
+```python
+# Global = Previous Global + weighted average of DELTA updates
+new_weights[key] = prev_global[key] + Σ (data_size_i / total_data) * delta_i[key]
+```
+
+**Fix**: Server cần nhận delta weights, tính weighted delta, rồi cộng vào global model trước đó.
+
+---
+
+#### Issue #2: Client trả về delta nhưng ClientManager chuyển sang absolute trước khi gửi server
+
+> [!WARNING]
+> Trong [client.py:244-245](file:///c:/CodePy/FedDRLPD_v2/client.py#L244-L245), `Client.train()` trả về **delta** đúng, nhưng `ClientManager.train_clients()` lại convert sang absolute:
+> ```python
+> delta_w = client.train(epochs=local_epochs)
+> abs_w = self.delta_to_absolute(global_weights, delta_w)  # ← chuyển ngược!
+> ```
+> Rồi server nhận absolute weights và dùng FedAvg → bản chất là weighted average of absolute weights, KHÁC với paper.
+
+**Fix**: Gửi **delta weights** trực tiếp cho server, server aggregate theo công thức incremental.
+
+---
+
+#### Issue #3: Không có MaliciousClient nào được tạo ra!
+
+> [!CAUTION]
+> Code có class `MaliciousClient` với các attack types (label_flipping, backdoor, noise) nhưng trong `train.py`, **tất cả clients đều là benign** `Client`:
+> ```python
+> for i in range(NUM_CLIENTS):
+>     clients.append(Client(i, ...))  # ← chỉ benign
+> ```
+> **Không có attacker nào → DQN không có gì để detect → mô phỏng vô nghĩa!**
+
+**Fix**: Thêm config tỷ lệ attacker (ví dụ 30%) và random assign các client thành `MaliciousClient` với attack type cụ thể.
+
+---
+
+#### Issue #4: Reward function sai công thức bài báo
+
+> [!WARNING]
+> Theo bài báo, reward function cần bao gồm:
+> - **Utility**: dựa trên accuracy gain + model distance
+> - **Penalty**: dựa trên malicious scores của clients đã chọn
+> - **Temporal smoothing**: `R_t = α * R_{t-1} + β * utility - λ * penalty`
+>
+> Code hiện tại ([dqn_agent.py:223-271](file:///c:/CodePy/FedDRLPD_v2/dqn_agent.py#L223-L271)) có cấu trúc tương tự nhưng:
+> 1. **`distance` tính sai**: dùng `(lw - gw) / (gw + eps)` — đây là relative difference, KHÔNG phải Euclidean distance hay cosine distance theo paper
+> 2. **`global_weights` trong reward** là mean of delta → không phải global model weights
+> 3. **Penalty normalization** dùng min-max trên batch → không ổn định
+
+**Fix**: Sửa lại distance metric đúng paper (Euclidean norm hoặc cosine similarity giữa local update và global update mean).
+
+---
+
+### 🟡 IMPORTANT Issues
+
+---
+
+#### Issue #5: State `S_t` thiếu normalize
+
+Bài báo yêu cầu state `S_t = {w_i_t, n_i_t, m_i_t, acc_t^g}`. Code hiện tại ([dqn_agent.py:146-191](file:///c:/CodePy/FedDRLPD_v2/dqn_agent.py#L146-L191)) nối raw values:
+- `data_size` có thể = 2500 (raw sample count)
+- `malicious_score` có thể = 0.001
+- `acc` ∈ [0, 1]
+- `PCA weights` ∈ arbitrary range
+
+**Vấn đề**: Các features ở scale khác nhau rất lớn → DQN học rất kém.
+
+**Fix**: Normalize mỗi component:
+- `data_size`: chia cho `max(data_sizes)` hoặc `total_data`
+- `malicious_score`: đã được normalize nếu dùng đúng formula
+- `PCA weights`: standardize (z-score) hoặc min-max
+
+---
+
+#### Issue #6: `CNNModel` duplicate trong `server.py` và `model.py`
+
+[server.py:10-38](file:///c:/CodePy/FedDRLPD_v2/server.py#L10-L38) có copy riêng `CNNModel` thay vì import từ `model.py`. Nếu sửa model kiến trúc → phải sửa 2 chỗ.
+
+**Fix**: Xóa `CNNModel` trong `server.py`, import từ `model.py`.
+
+---
+
+#### Issue #7: Server tạo model mới trong `__init__` nhưng bị overwrite ngay sau đó
+
+```python
+# server.py __init__
+self.global_model = CNNModel().to(device)  # ← tạo model
+
+# train.py
+server.global_model = global_model.to(DEVICE)  # ← ghi đè
+```
+
+Model trong `server.__init__` bị waste và có thể gây confusing.
+
+---
+
+#### Issue #8: `ClientManager.select_clients` bị monkey-patch trong train loop
+
+```python
+# train.py:184
+client_manager.select_clients = lambda _state, ids=selected_ids: np.array(ids)
+```
+
+Mỗi round gắn lambda mới → hacky, dễ bug. `ClientManager.select_clients` bên trong `train_clients` cũng gọi lại, tạo coupling phức tạp.
+
+**Fix**: Refactor để `train_clients` nhận `selected_ids` trực tiếp thay vì monkey-patch method.
+
+---
+
+#### Issue #9: Thiếu data augmentation cho CIFAR-10/100
+
+Dataset chỉ dùng `transforms.ToTensor()` mà không có augmentation (random crop, horizontal flip, normalization). Điều này ảnh hưởng đến accuracy baseline → reward signal kém.
+
+---
+
+### 🟢 ENHANCEMENT
+
+---
+
+#### Issue #10: Thiếu logging & visualization
+
+Không có:
+- Tensorboard/CSV logging cho accuracy, loss, reward qua rounds
+- Attacker detection accuracy (precision/recall/F1)
+- Plot accuracy curve so sánh có/không defense
+
+---
+
+#### Issue #11: Chỉ 20 rounds → quá ít
+
+Paper thường chạy 100-500 rounds. 20 rounds không đủ để DQN converge.
+
+---
+
+#### Issue #12: Thiếu evaluation metrics cho defense
+
+Cần đánh giá:
+- **True Positive Rate**: DQN loại đúng attacker
+- **False Positive Rate**: DQN loại nhầm benign
+- **Attack Success Rate (ASR)**: cho backdoor attack
+- So sánh accuracy với FedAvg baseline (không defense)
+
+---
+
+## 4. Proposed Changes
+
+### Component 1: Core Aggregation Fix
+
+#### [MODIFY] [server.py](file:///c:/CodePy/FedDRLPD_v2/server.py)
+- Xóa duplicate `CNNModel` class, import từ `model.py`
+- Sửa `aggregate()` nhận **delta weights** + previous global weights, thực hiện incremental update theo paper
+- Sửa `training_round()` để truyền đúng delta
+- Thêm normalize cho test data (CIFAR-10: mean/std)
+
+#### [MODIFY] [client.py](file:///c:/CodePy/FedDRLPD_v2/client.py)
+- `ClientManager.train_clients()` gửi **delta weights** thay vì absolute
+- Nhận `selected_ids` parameter trực tiếp (bỏ monkey-patch)
+- Refactor method signature
+
+---
+
+### Component 2: Attacker Simulation
+
+#### [MODIFY] [train.py](file:///c:/CodePy/FedDRLPD_v2/train.py)
+- Thêm config `MALICIOUS_RATIO`, `ATTACK_TYPE`
+- Tạo `MaliciousClient` cho % clients được chỉ định
+- Tăng `ROUNDS` lên 100 (configurable)
+- Bỏ monkey-patch `select_clients`
+
+---
+
+### Component 3: DQN & Reward Fix
+
+#### [MODIFY] [dqn_agent.py](file:///c:/CodePy/FedDRLPD_v2/dqn_agent.py)
+- Sửa `compute_reward()`: distance metric dùng Euclidean norm
+- Sửa `build_state()`: normalize features (data_size, malicious_score)
+- Thêm gradient clipping cho DQN training
+
+---
+
+### Component 4: State & Malicious Score
+
+#### [MODIFY] [malicious_score.py](file:///c:/CodePy/FedDRLPD_v2/malicious_score.py)
+- Verify `Att_ip` formula: `Att_ip = 1 + count / round_idx` ✅ đúng paper
+- Verify `m_i = Att_ip * MD_i` ✅ đúng paper
+- Cải thiện numerical stability cho Mahalanobis distance
+
+---
+
+### Component 5: Data Pipeline
+
+#### [MODIFY] [dataset.py](file:///c:/CodePy/FedDRLPD_v2/dataset.py)
+- Thêm data augmentation cho training data
+- Thêm proper normalization (CIFAR-10 mean/std)
+
+---
+
+### Component 6: Evaluation & Logging
+
+#### [NEW] [evaluate.py](file:///c:/CodePy/FedDRLPD_v2/evaluate.py)
+- Defense metrics: TPR, FPR, F1 cho attacker detection
+- ASR cho backdoor attacks
+- CSV logger cho tất cả metrics theo round
+
+#### [NEW] [config.py](file:///c:/CodePy/FedDRLPD_v2/config.py)
+- Tập trung tất cả hyperparameters vào 1 file
+- Support argparse cho command-line override
+
+---
+
+## 5. Open Questions
+
+> [!IMPORTANT]
+> 1. **Attack type**: Bạn muốn test attack type nào? Paper thường test cả 3: `label_flipping`, `backdoor`, `noise`. Bạn muốn tôi implement cả 3 hay focus vào 1 loại trước?
+> 2. **Malicious ratio**: Paper thường test 10%, 20%, 30% attackers. Bạn muốn dùng tỷ lệ nào?
+> 3. **Số rounds**: Paper dùng 100-500 rounds. Bạn muốn dùng bao nhiêu cho simulation?
+> 4. **Dataset**: Hiện tại code support CIFAR-10, CIFAR-100, FashionMNIST. Bạn muốn focus dataset nào?
+> 5. **Baseline comparison**: Bạn có muốn tôi thêm baseline FedAvg không defense để so sánh?
+
+---
+
+## 6. Verification Plan
+
+### Automated Tests
+1. Run training 10 rounds với 30% attackers, verify:
+   - Accuracy tăng dần qua rounds
+   - DQN loss giảm
+   - Malicious clients bị detect (TPR > 0)
+2. So sánh aggregation output trước/sau fix với manual calculation
+
+### Manual Verification  
+1. Check log output mỗi round: accuracy, reward, selected clients, attacker detection
+2. Plot accuracy curve và compare với expected behavior từ paper
+
+---
+
+## 7. Tóm tắt ưu tiên
+
+| Priority | Issue | Impact |
+|----------|-------|--------|
+| 🔴 Critical | #1 Aggregation sai | Model không converge đúng |
+| 🔴 Critical | #2 Delta→Absolute conversion | Sai logic aggregation |
+| 🔴 Critical | #3 Không có attacker | DQN vô nghĩa |
+| 🔴 Critical | #4 Reward function sai | DQN học sai |
+| 🟡 Important | #5 State không normalize | DQN học kém |
+| 🟡 Important | #6 Duplicate model | Maintenance issue |
+| 🟡 Important | #7 Model overwrite waste | Code quality |
+| 🟡 Important | #8 Monkey-patch | Code quality |
+| 🟡 Important | #9 No augmentation | Accuracy thấp |
+| 🟢 Enhancement | #10 No logging | Không đánh giá được |
+| 🟢 Enhancement | #11 Ít rounds | DQN chưa converge |
+| 🟢 Enhancement | #12 No defense metrics | Thiếu evaluation |
