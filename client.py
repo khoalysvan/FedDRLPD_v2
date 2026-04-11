@@ -26,15 +26,30 @@ class Client:
                  batch_size=32):
 
         self.client_id = client_id
-        self.dataset = dataset
-        self.device = device
+        self.dataset   = dataset
+        self.device    = device
 
         self.model = deepcopy(model).to(device)
 
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
 
-        self.data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        # SGD với momentum + weight decay — chuẩn thực nghiệm CIFAR
+        self.optimizer = optim.SGD(
+            self.model.parameters(),
+            lr=0.01,
+            momentum=0.9,
+            weight_decay=5e-4,
+        )
+
+        self.data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            # ⚠️ Windows: num_workers > 0 gây hang/deadlock — luôn dùng 0
+            # Linux/Mac: có thể tăng lên 4 để tăng tốc
+            num_workers=0,
+            pin_memory=False,  # chỉ có lợi khi num_workers > 0
+        )
 
         # tiện cho mô phỏng/đánh giá detection
         self.is_malicious = False
