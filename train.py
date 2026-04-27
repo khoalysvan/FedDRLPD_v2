@@ -68,11 +68,17 @@ if __name__ == "__main__":
     REPLAY_BUFFER_CAPACITY = 8000
 
     NUM_CLIENTS   = NUM_USERS
-    ROUNDS        = 50
+    ROUNDS        = 200
     DATASET       = "cifar10"
     IID           = False
     ALPHA         = 0.5
-    DQN_BATCH_SIZE = BATCH_SIZE
+    DQN_BATCH_SIZE      = 32
+    DQN_GAMMA           = 0.95
+    DQN_EPSILON_START   = 1.0
+    DQN_EPSILON_DECAY   = 0.97
+    DQN_EPSILON_MIN     = 0.02
+    DQN_WARMUP_STEPS    = 32
+    DQN_TARGET_UPD_STEP = 10
 
     # ── ATTACKER CONFIG ──────────────────────────────────────────────
     MALICIOUS_RATIO = 0.3         # 30% clients là attacker (paper: 5%-40%)
@@ -149,6 +155,11 @@ if __name__ == "__main__":
     print(f"ROUNDS:          {ROUNDS}")
     print(f"PCA_COMPONENTS:  {PCA_COMPONENTS}")
     print(f"REPLAY_BUFFER:   {REPLAY_BUFFER_RANGE[0]}~{REPLAY_BUFFER_RANGE[1]} (using {REPLAY_BUFFER_CAPACITY})")
+    print(
+        f"DQN cfg:         batch={DQN_BATCH_SIZE}, gamma={DQN_GAMMA}, "
+        f"eps=({DQN_EPSILON_START}->{DQN_EPSILON_MIN}, decay={DQN_EPSILON_DECAY}), "
+        f"warmup={DQN_WARMUP_STEPS}, target_upd={DQN_TARGET_UPD_STEP}"
+    )
 
     print(f"\n=== Attacker Setup ===")
     print(f"MALICIOUS_RATIO: {MALICIOUS_RATIO} ({num_malicious}/{NUM_CLIENTS})")
@@ -183,7 +194,13 @@ if __name__ == "__main__":
         num_clients=NUM_CLIENTS,
         select_ratio=0.5,
         device=DQN_DEVICE,
+        gamma=DQN_GAMMA,
+        epsilon=DQN_EPSILON_START,
         replay_capacity=REPLAY_BUFFER_CAPACITY,
+        update_target_steps=DQN_TARGET_UPD_STEP,
+        epsilon_decay=DQN_EPSILON_DECAY,
+        epsilon_min=DQN_EPSILON_MIN,
+        warmup_steps=DQN_WARMUP_STEPS,
     )
 
     # ── INIT CLIENT MANAGER ──────────────────────────────────────────
@@ -210,8 +227,21 @@ if __name__ == "__main__":
         global_weights = server.broadcast_model()
         global_flat    = flatten_weights(global_weights)
 
-        # Step 2: DQN select top-P clients
-        selected_ids = dqn.select_action(current_state)
+        # Step 2: Round-1 bootstrap train all clients; from round-2 use DQN
+        if round_idx == 1:
+            selected_ids = list(range(NUM_CLIENTS))
+            q_stats = dqn.get_q_stats(current_state)
+            selection_info = {
+                "epsilon": float(dqn.epsilon),
+                "mode": "bootstrap_all_clients",
+                "random_count": 0,
+                "greedy_count": NUM_CLIENTS,
+                "selected_q_mean": q_stats["q_mean"],
+                **q_stats,
+            }
+        else:
+            selected_ids_np, selection_info = dqn.select_action(current_state, return_info=True)
+            selected_ids = [int(i) for i in selected_ids_np.tolist()]
 
         # Step 3-4: Local train + malicious scoring
         updates_pack = client_manager.train_clients(
@@ -235,6 +265,8 @@ if __name__ == "__main__":
         selected_set = set(selected_ids)
         mal_selected = [i for i in selected_ids if i in malicious_ids]
         ben_selected = [i for i in selected_ids if i not in malicious_ids]
+        attacker_sel_ratio = len(mal_selected) / max(1, trained_clients)
+        random_pick_ratio = selection_info["random_count"] / max(1, trained_clients)
 
         tp  = len(mal_selected)                            # malicious bị chọn (xấu)
         fp  = len(ben_selected)                            # benign bị loại nhầm (0 ở đây)
@@ -278,10 +310,13 @@ if __name__ == "__main__":
         )
 
         # ── REWARD (Eq. 15-18) ───────────────────────────────────────
+        # Dùng cùng một global reference vector cho mỗi local delta để
+        # compute_reward so sánh theo cặp vector-vector (không bị zip với scalar).
+        global_refs = [global_flat for _ in range(len(full_delta_list))]
         reward = dqn.compute_reward(
             prev_reward,
             full_delta_list,
-            global_flat,
+            global_refs,
             feedback["round_accuracy"],
             feedback["prev_accuracy"],
             feedback["malicious_scores"],
@@ -307,6 +342,12 @@ if __name__ == "__main__":
         writer.add_scalar("DQN/reward",           reward,            round_idx)
         writer.add_scalar("DQN/epsilon",          dqn.epsilon,       round_idx)
         writer.add_scalar("DQN/replay_size",      len(dqn.memory),   round_idx)
+        writer.add_scalar("DQN/q_min",            selection_info["q_min"], round_idx)
+        writer.add_scalar("DQN/q_max",            selection_info["q_max"], round_idx)
+        writer.add_scalar("DQN/q_mean",           selection_info["q_mean"], round_idx)
+        writer.add_scalar("DQN/q_std",            selection_info["q_std"], round_idx)
+        writer.add_scalar("DQN/q_topk_mean",      selection_info["q_topk_mean"], round_idx)
+        writer.add_scalar("DQN/selected_q_mean",  selection_info["selected_q_mean"], round_idx)
         if dqn_loss is not None:
             writer.add_scalar("DQN/loss",         dqn_loss,          round_idx)
 
@@ -323,6 +364,8 @@ if __name__ == "__main__":
         # 5) Client selection breakdown
         writer.add_scalar("Selection/total_selected",    trained_clients,     round_idx)
         writer.add_scalar("Selection/malicious_in_sel",  len(mal_selected),   round_idx)
+        writer.add_scalar("Selection/attacker_ratio",    attacker_sel_ratio,  round_idx)
+        writer.add_scalar("Selection/random_pick_ratio", random_pick_ratio,   round_idx)
         writer.add_scalar("Selection/benign_in_sel",     len(ben_selected),   round_idx)
         writer.add_scalar("Selection/total_samples",     selected_samples,    round_idx)
 
@@ -337,17 +380,21 @@ if __name__ == "__main__":
 
         eta_sec = max(0.0, (ROUNDS - round_idx) * avg_round_sec)
 
+        dqn_train_min_buffer = max(DQN_BATCH_SIZE, DQN_WARMUP_STEPS)
         dqn_info = (
             f"DQN Loss: {dqn_loss:.6f} | Epsilon: {dqn.epsilon:.4f} | Replay: {replay_size}"
             if dqn_loss is not None
-            else f"DQN Loss: warming up ({replay_size}/{DQN_BATCH_SIZE}) | Epsilon: {dqn.epsilon:.4f}"
+            else f"DQN Loss: warming up ({replay_size}/{dqn_train_min_buffer}) | Epsilon: {dqn.epsilon:.4f}"
         )
         tqdm.write(dqn_info)
         tqdm.write(
             f"Round {round_idx:02d} | time={round_sec:.1f}s | "
             f"acc={global_acc:.4f} | loss={global_loss:.4f} | rw={reward:.4f} | "
             f"TPR={tpr:.2f} | FPR={fpr:.2f} | "
-            f"mal_in_sel={len(mal_selected)}/{num_malicious}"
+            f"mal_in_sel={len(mal_selected)}/{num_malicious} | "
+            f"atk_ratio={attacker_sel_ratio:.2f} | "
+            f"rand_pick={selection_info['random_count']}/{trained_clients} | "
+            f"q_mean={selection_info['q_mean']:.4f}"
         )
         round_bar.set_postfix(
             acc  = f"{global_acc:.4f}",

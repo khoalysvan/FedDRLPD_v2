@@ -77,7 +77,8 @@ class DQNAgent:
                  epsilon_decay=0.995,
                  epsilon_min=0.05,
                  update_target_steps=10,
-                 replay_capacity=10000):
+                 replay_capacity=10000,
+                 warmup_steps=0):
 
         self.device = device
 
@@ -107,6 +108,7 @@ class DQNAgent:
 
         self.update_target_steps = update_target_steps
         self.step_count = 0
+        self.warmup_steps = int(max(0, warmup_steps))
 
         self.prev_state = None
         self.prev_action_mask = None
@@ -224,25 +226,82 @@ class DQNAgent:
 # Action selection (Top-P)
 # =========================
 
-    def select_action(self, state):
-
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-
-        if random.random() < self.epsilon:
-            selected = np.random.choice(
-                self.num_clients,
-                self.select_num,
-                replace=False
-            )
-            return selected
+    def _compute_q_values(self, state):
+        state_arr = self._ensure_state_dim(np.asarray(state, dtype=np.float32))
+        state_tensor = torch.from_numpy(state_arr).float().unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            q_values = self.primary_q_net(state).cpu().numpy().flatten()
+            q_values = self.primary_q_net(state_tensor).squeeze(0).cpu().numpy().astype(np.float32)
 
-        # chọn top-P Q values
-        selected = np.argsort(q_values)[-self.select_num:]
+        return q_values
 
-        return selected
+    def get_q_stats(self, state):
+        q_values = self._compute_q_values(state)
+        topk_vals = np.sort(q_values)[-self.select_num:]
+
+        return {
+            "q_min": float(np.min(q_values)),
+            "q_max": float(np.max(q_values)),
+            "q_mean": float(np.mean(q_values)),
+            "q_std": float(np.std(q_values)),
+            "q_topk_mean": float(np.mean(topk_vals)),
+        }
+
+    def select_action(self, state, return_info=False):
+
+        q_values = self._compute_q_values(state)
+        ranked_clients = [int(i) for i in np.argsort(q_values)[::-1].tolist()]
+        epsilon_used = float(self.epsilon)
+
+        available = set(range(self.num_clients))
+        selected = []
+        random_count = 0
+        greedy_count = 0
+
+        # Mixed epsilon-greedy theo từng slot chọn (paper-style),
+        # không phải all-or-nothing cho cả tập A_t.
+        for _ in range(self.select_num):
+            do_random = random.random() < epsilon_used
+
+            if do_random:
+                pick = random.choice(tuple(available))
+                random_count += 1
+            else:
+                pick = None
+                while ranked_clients:
+                    cand = ranked_clients.pop(0)
+                    if cand in available:
+                        pick = cand
+                        greedy_count += 1
+                        break
+
+                if pick is None:
+                    pick = random.choice(tuple(available))
+                    random_count += 1
+
+            selected.append(int(pick))
+            available.remove(int(pick))
+
+        selected = np.asarray(selected, dtype=np.int64)
+
+        # Decay epsilon theo mỗi bước ra quyết định (mỗi round FL có 1 action).
+        self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
+
+        if not return_info:
+            return selected
+
+        q_stats = self.get_q_stats(state)
+        selected_q = q_values[selected] if selected.size > 0 else np.array([0.0], dtype=np.float32)
+        info = {
+            "epsilon": epsilon_used,
+            "mode": "mixed_epsilon_greedy",
+            "random_count": int(random_count),
+            "greedy_count": int(greedy_count),
+            "selected_q_mean": float(np.mean(selected_q)),
+            **q_stats,
+        }
+
+        return selected, info
 
 
 # =========================
@@ -262,18 +321,54 @@ class DQNAgent:
 
         # ===== Utility =====
         eps = 1e-8
-        if len(local_weights) == 0 or len(global_weights) == 0:
+        if len(local_weights) == 0:
             distance = 0.0
         else:
-            distance = 0.0
-            pn = max(1, len(local_weights[0]))
-            for lw, gw in zip(local_weights, global_weights):
-                lw = np.asarray(lw, dtype=np.float32)
-                gw = np.asarray(gw, dtype=np.float32)
-                diff = (lw - gw) / (gw + eps)
-                distance += float(np.sum(np.abs(diff)) / pn)
+            local_vecs = [np.asarray(w, dtype=np.float32).reshape(-1) for w in local_weights]
 
-            distance /= max(1, len(local_weights))
+            # global_weights có thể là:
+            # 1) một vector tham chiếu dùng chung cho mọi local update, hoặc
+            # 2) list các vector tham chiếu (cùng số lượng với local_vecs).
+            if isinstance(global_weights, (list, tuple)):
+                if len(global_weights) == 0:
+                    distance = 0.0
+                    local_vecs = []
+                    ref_vecs = []
+                else:
+                    first_ref = np.asarray(global_weights[0], dtype=np.float32)
+                    if first_ref.ndim == 0:
+                        raise ValueError(
+                            "global_weights must be a reference vector or list of reference vectors, not scalars."
+                        )
+                    if len(global_weights) != len(local_vecs):
+                        raise ValueError(
+                            f"global_weights length ({len(global_weights)}) must match local_weights length ({len(local_vecs)})."
+                        )
+                    ref_vecs = [np.asarray(gw, dtype=np.float32).reshape(-1) for gw in global_weights]
+            else:
+                ref = np.asarray(global_weights, dtype=np.float32).reshape(-1)
+                if ref.size == 0:
+                    distance = 0.0
+                    local_vecs = []
+                    ref_vecs = []
+                else:
+                    ref_vecs = [ref for _ in range(len(local_vecs))]
+
+            if len(local_vecs) == 0:
+                distance = 0.0
+            else:
+                distance = 0.0
+                for idx, (lw, gw) in enumerate(zip(local_vecs, ref_vecs)):
+                    if lw.shape != gw.shape:
+                        raise ValueError(
+                            f"Shape mismatch at sample {idx}: local {lw.shape} vs global {gw.shape}."
+                        )
+
+                    pn = max(1, lw.size)
+                    diff = (lw - gw) / (np.abs(gw) + eps)
+                    distance += float(np.sum(np.abs(diff)) / pn)
+
+                distance /= float(len(local_vecs))
 
         if global_acc > prev_acc:
             utility = float(global_acc + np.exp(-distance))
@@ -327,7 +422,8 @@ class DQNAgent:
 
     def train(self, batch_size=32):
 
-        if len(self.memory) < batch_size:
+        min_buffer = max(int(batch_size), self.warmup_steps)
+        if len(self.memory) < min_buffer:
             return None
 
         states, action_masks, rewards, next_states, dones = self.memory.sample(batch_size)
@@ -346,11 +442,9 @@ class DQNAgent:
         q_sa = (q_values * action_masks).sum(dim=1) / selected_count
 
         # target = r + gamma * max_A' Q_target(s', A')
-        # xấp xỉ bằng trung bình top-P q-values ở s'
         with torch.no_grad():
             next_q_all = self.target_q_net(next_states)
-            topk_next_q = torch.topk(next_q_all, k=self.select_num, dim=1).values
-            next_q = topk_next_q.mean(dim=1)
+            next_q = next_q_all.max(dim=1).values
 
         target = rewards + (1.0 - dones) * self.gamma * next_q
 
@@ -359,10 +453,6 @@ class DQNAgent:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-
-        # epsilon decay
-        self.epsilon = max(self.epsilon * self.epsilon_decay,
-                           self.epsilon_min)
 
         # update target network
         self.step_count += 1
