@@ -11,7 +11,7 @@ from collections import deque
 # =========================
 
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim):
         super(QNetwork, self).__init__()
 
         self.net = nn.Sequential(
@@ -19,11 +19,16 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, action_dim)
+            nn.Linear(256, 1)
         )
 
     def forward(self, x):
-        return self.net(x)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+
+        bsz, num_clients, feat_dim = x.shape
+        y = self.net(x.reshape(bsz * num_clients, feat_dim))
+        return y.reshape(bsz, num_clients)
 
 
 # =========================
@@ -34,26 +39,23 @@ class ReplayBuffer:
     def __init__(self, capacity=10000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action_mask, reward, next_state, done=False):
-        self.buffer.append((state, action_mask, reward, next_state, done))
+    def push(self, state, action_mask, reward, next_state):
+        self.buffer.append((state, action_mask, reward, next_state))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
 
-        states, action_masks, rewards, next_states, dones = zip(*batch)
+        states, action_masks, rewards, next_states = zip(*batch)
 
         states = np.asarray(states, dtype=np.float32)
         action_masks = np.asarray(action_masks, dtype=np.float32)
         rewards = np.asarray(rewards, dtype=np.float32)
         next_states = np.asarray(next_states, dtype=np.float32)
-        dones = np.asarray(dones, dtype=np.float32)
-
         return (
             torch.from_numpy(states),
             torch.from_numpy(action_masks),
             torch.from_numpy(rewards),
-            torch.from_numpy(next_states),
-            torch.from_numpy(dones)
+            torch.from_numpy(next_states)
         )
 
     def __len__(self):
@@ -89,8 +91,8 @@ class DQNAgent:
         self.select_num = max(1, int(num_clients * select_ratio))
         self.state_dim = state_dim
 
-        self.primary_q_net = QNetwork(state_dim, self.action_dim).to(device)
-        self.target_q_net = QNetwork(state_dim, self.action_dim).to(device)
+        self.primary_q_net = QNetwork(state_dim).to(device)
+        self.target_q_net = QNetwork(state_dim).to(device)
         self.target_q_net.load_state_dict(self.primary_q_net.state_dict())
 
         # Backward-compatible aliases
@@ -114,15 +116,36 @@ class DQNAgent:
         self.prev_action_mask = None
 
     def _ensure_state_dim(self, state_arr):
-        if state_arr.shape[0] == self.state_dim:
-            return state_arr
+        arr = np.asarray(state_arr, dtype=np.float32)
 
-        if state_arr.shape[0] > self.state_dim:
-            return state_arr[:self.state_dim]
+        if arr.ndim == 1:
+            if arr.size == self.state_dim:
+                arr = np.tile(arr.reshape(1, -1), (self.num_clients, 1))
+            elif arr.size == self.num_clients * self.state_dim:
+                arr = arr.reshape(self.num_clients, self.state_dim)
+            else:
+                padded = np.zeros((self.num_clients, self.state_dim), dtype=np.float32)
+                flat = arr.reshape(-1)
+                take = min(flat.size, self.num_clients * self.state_dim)
+                padded.reshape(-1)[:take] = flat[:take]
+                arr = padded
 
-        padded = np.zeros(self.state_dim, dtype=np.float32)
-        padded[:state_arr.shape[0]] = state_arr
-        return padded
+        if arr.ndim != 2:
+            raise ValueError(f"state must be 2D [num_clients, state_dim], got shape {arr.shape}")
+
+        if arr.shape[0] != self.num_clients:
+            fixed_rows = np.zeros((self.num_clients, arr.shape[1]), dtype=np.float32)
+            take_rows = min(self.num_clients, arr.shape[0])
+            fixed_rows[:take_rows] = arr[:take_rows]
+            arr = fixed_rows
+
+        if arr.shape[1] != self.state_dim:
+            fixed_cols = np.zeros((self.num_clients, self.state_dim), dtype=np.float32)
+            take_cols = min(self.state_dim, arr.shape[1])
+            fixed_cols[:, :take_cols] = arr[:, :take_cols]
+            arr = fixed_cols
+
+        return arr
 
     def _action_to_mask(self, action):
         mask = np.zeros(self.num_clients, dtype=np.float32)
@@ -166,7 +189,6 @@ class DQNAgent:
         """
 
         eps = 1e-8
-        state = []
 
         if client_ids is None:
             client_ids = list(range(len(weights)))
@@ -205,20 +227,23 @@ class DQNAgent:
         size_norm_map = {cid: size_norm[i] for i, cid in enumerate(client_ids)}
         mal_norm_map  = {cid: mal_norm[i]  for i, cid in enumerate(client_ids)}
 
-        # ── assemble state vector ──
+        # ── assemble state matrix [N, F] ──
+        state_rows = []
         for cid in range(self.num_clients):
+            row = []
             if cid not in w_norm_map:
-                state.extend([0.0] * weight_dim)
-                state.append(0.0)   # size  → 0 proportion
-                state.append(0.0)   # score → 0 (benign-neutral)
+                row.extend([0.0] * weight_dim)
+                row.append(0.0)   # size  → 0 proportion
+                row.append(0.0)   # score → 0 (benign-neutral)
             else:
-                state.extend(w_norm_map[cid].tolist())
-                state.append(float(size_norm_map[cid]))
-                state.append(float(mal_norm_map[cid]))
+                row.extend(w_norm_map[cid].tolist())
+                row.append(float(size_norm_map[cid]))
+                row.append(float(mal_norm_map[cid]))
 
-        state.append(float(global_acc))   # already ∈ [0, 1]
+            row.append(float(global_acc))
+            state_rows.append(row)
 
-        state_arr = np.array(state, dtype=np.float32)
+        state_arr = np.array(state_rows, dtype=np.float32)
         return self._ensure_state_dim(state_arr)
 
 
@@ -309,7 +334,8 @@ class DQNAgent:
 # =========================
 
     def compute_reward(self,
-                       prev_reward,
+                       prev_rewards,
+                       selected_ids,
                        local_weights,
                        global_weights,
                        global_acc,
@@ -319,99 +345,90 @@ class DQNAgent:
                        beta=0.5,
                        lam=0.3):
 
-        # ===== Utility =====
+        # Reward vector R_t với shape [N]
         eps = 1e-8
-        if len(local_weights) == 0:
-            distance = 0.0
+        prev_arr = np.asarray(prev_rewards, dtype=np.float32).reshape(-1)
+        if prev_arr.size == 1:
+            prev_arr = np.full((self.num_clients,), float(prev_arr[0]), dtype=np.float32)
+
+        reward_vec = np.zeros((self.num_clients,), dtype=np.float32)
+        take = min(self.num_clients, prev_arr.size)
+        reward_vec[:take] = prev_arr[:take]
+
+        if len(selected_ids) == 0:
+            return reward_vec
+
+        selected_ids = [int(cid) for cid in selected_ids]
+        if len(local_weights) != len(selected_ids):
+            raise ValueError("local_weights length must match selected_ids length.")
+
+        if isinstance(global_weights, (list, tuple)):
+            if len(global_weights) != len(local_weights):
+                raise ValueError("global_weights length must match local_weights length.")
+            ref_vecs = [np.asarray(gw, dtype=np.float32).reshape(-1) for gw in global_weights]
         else:
-            local_vecs = [np.asarray(w, dtype=np.float32).reshape(-1) for w in local_weights]
+            ref = np.asarray(global_weights, dtype=np.float32).reshape(-1)
+            ref_vecs = [ref for _ in range(len(local_weights))]
 
-            # global_weights có thể là:
-            # 1) một vector tham chiếu dùng chung cho mọi local update, hoặc
-            # 2) list các vector tham chiếu (cùng số lượng với local_vecs).
-            if isinstance(global_weights, (list, tuple)):
-                if len(global_weights) == 0:
-                    distance = 0.0
-                    local_vecs = []
-                    ref_vecs = []
-                else:
-                    first_ref = np.asarray(global_weights[0], dtype=np.float32)
-                    if first_ref.ndim == 0:
-                        raise ValueError(
-                            "global_weights must be a reference vector or list of reference vectors, not scalars."
-                        )
-                    if len(global_weights) != len(local_vecs):
-                        raise ValueError(
-                            f"global_weights length ({len(global_weights)}) must match local_weights length ({len(local_vecs)})."
-                        )
-                    ref_vecs = [np.asarray(gw, dtype=np.float32).reshape(-1) for gw in global_weights]
+        m = np.abs(np.asarray(malicious_scores, dtype=np.float32)).reshape(-1)
+        if m.size == 0:
+            m = np.zeros((len(selected_ids),), dtype=np.float32)
+        if m.size != len(selected_ids):
+            fixed = np.zeros((len(selected_ids),), dtype=np.float32)
+            fixed[:min(m.size, fixed.size)] = m[:min(m.size, fixed.size)]
+            m = fixed
+
+        for j, cid in enumerate(selected_ids):
+            lw = np.asarray(local_weights[j], dtype=np.float32).reshape(-1)
+            gw = ref_vecs[j]
+
+            if lw.shape != gw.shape:
+                raise ValueError(f"Shape mismatch at sample {j}: local {lw.shape} vs global {gw.shape}.")
+
+            pn = max(1, lw.size)
+            diff = (lw - gw) / (np.abs(gw) + eps)
+            dist_i = float(np.sum(np.abs(diff)) / pn)
+
+            if global_acc > prev_acc:
+                utility_i = float(np.exp(-dist_i) + global_acc)
             else:
-                ref = np.asarray(global_weights, dtype=np.float32).reshape(-1)
-                if ref.size == 0:
-                    distance = 0.0
-                    local_vecs = []
-                    ref_vecs = []
-                else:
-                    ref_vecs = [ref for _ in range(len(local_vecs))]
+                utility_i = float(1.0 - np.exp(-dist_i))
 
-            if len(local_vecs) == 0:
-                distance = 0.0
-            else:
-                distance = 0.0
-                for idx, (lw, gw) in enumerate(zip(local_vecs, ref_vecs)):
-                    if lw.shape != gw.shape:
-                        raise ValueError(
-                            f"Shape mismatch at sample {idx}: local {lw.shape} vs global {gw.shape}."
-                        )
+            # Use RAW malicious score (no min-max normalization) to avoid
+            # collapsing penalty signal when selected scores are close.
+            m_raw = float(max(0.0, m[j]))
+            penalty_i = float(1.0 - np.exp(-m_raw))
+            reward_vec[cid] = float(alpha * reward_vec[cid] + beta * utility_i - lam * penalty_i)
 
-                    pn = max(1, lw.size)
-                    diff = (lw - gw) / (np.abs(gw) + eps)
-                    distance += float(np.sum(np.abs(diff)) / pn)
-
-                distance /= float(len(local_vecs))
-
-        if global_acc > prev_acc:
-            utility = float(global_acc + np.exp(-distance))
-        else:
-            utility = float(1.0 - np.exp(-distance))
-
-        if len(malicious_scores) == 0:
-            penalty = 0.0
-        else:
-            m = np.abs(np.asarray(malicious_scores, dtype=np.float32))
-            m_min = float(np.min(m))
-            m_max = float(np.max(m))
-
-            # Paper score is bounded; normalize raw detector outputs to [0, 1].
-            if m_max - m_min > eps:
-                m = (m - m_min) / (m_max - m_min + eps)
-            else:
-                m = np.zeros_like(m)
-
-            penalty = float(np.mean(1.0 - np.exp(-m)))
-
-        reward = alpha * prev_reward + beta * utility - lam * penalty
-
-        return float(reward)
+        return reward_vec
 
 
 # =========================
 # Store experience
 # =========================
 
-    def remember(self, state, action, reward, next_state, done=False):
+    def remember(self, state, action, reward, next_state):
         state_arr = self._ensure_state_dim(np.asarray(state, dtype=np.float32))
         next_state_arr = self._ensure_state_dim(np.asarray(next_state, dtype=np.float32))
         action_mask = self._action_to_mask(action)
-        self.memory.push(state_arr, action_mask, float(reward), next_state_arr, float(done))
+        reward_arr = np.asarray(reward, dtype=np.float32).reshape(-1)
+
+        if reward_arr.size == 1:
+            reward_arr = np.full((self.num_clients,), float(reward_arr[0]), dtype=np.float32)
+        elif reward_arr.size != self.num_clients:
+            fixed = np.zeros((self.num_clients,), dtype=np.float32)
+            fixed[:min(self.num_clients, reward_arr.size)] = reward_arr[:min(self.num_clients, reward_arr.size)]
+            reward_arr = fixed
+
+        self.memory.push(state_arr, action_mask, reward_arr, next_state_arr)
 
 
 # =========================
 # Stateful transition update
 # =========================
 
-    def update_transition(self, curr_state, action, reward, next_state, done=False):
-        self.remember(curr_state, action, reward, next_state, done=done)
+    def update_transition(self, curr_state, action, reward, next_state):
+        self.remember(curr_state, action, reward, next_state)
         self.prev_state = np.asarray(next_state, dtype=np.float32)
         self.prev_action_mask = self._action_to_mask(action)
 
@@ -426,29 +443,26 @@ class DQNAgent:
         if len(self.memory) < min_buffer:
             return None
 
-        states, action_masks, rewards, next_states, dones = self.memory.sample(batch_size)
+        states, action_masks, rewards, next_states = self.memory.sample(batch_size)
 
         states = states.to(self.device)
         action_masks = action_masks.to(self.device)
         rewards = rewards.to(self.device)
         next_states = next_states.to(self.device)
-        dones = dones.to(self.device)
 
-        # Q_primary(s, *)
+        # Q_main(s_t) có shape (B, N)
         q_values = self.primary_q_net(states)
 
-        # Q(s, A_t): trung bình Q-value trên top-P client đã chọn
-        selected_count = torch.clamp(action_masks.sum(dim=1), min=1.0)
-        q_sa = (q_values * action_masks).sum(dim=1) / selected_count
-
-        # target = r + gamma * max_A' Q_target(s', A')
+        # Q_target(s_{t+1}) có shape (B, N)
         with torch.no_grad():
             next_q_all = self.target_q_net(next_states)
-            next_q = next_q_all.max(dim=1).values
+            # Không reduce theo batch dimension để tránh trộn temporal giữa các samples.
+            # target_q giữ nguyên shape (B, N) theo từng experience và từng client.
+            target_q = rewards + self.gamma * next_q_all
 
-        target = rewards + (1.0 - dones) * self.gamma * next_q
-
-        loss = nn.MSELoss()(q_sa, target)
+        # Loss element-wise trên (B, N), sau đó mới mean để backprop.
+        loss_matrix = nn.MSELoss(reduction="none")(q_values, target_q)
+        loss = loss_matrix.mean()
 
         self.optimizer.zero_grad()
         loss.backward()

@@ -206,6 +206,11 @@ class ClientManager:
         # lịch sử attacker cho toàn bộ client theo global client_id
         self.client_history = [0] * len(clients)
 
+        # Memory bank: latest flattened delta update cho TOÀN BỘ clients.
+        # - selected round hiện tại: cập nhật vector mới
+        # - không selected: giữ vector cũ
+        self.all_client_updates = [None] * len(clients)
+
 
 # =========================
 # SELECT CLIENTS — fallback (private)
@@ -296,6 +301,10 @@ class ClientManager:
             })
             delta_weights_list.append(flatten_weights(delta_w))
 
+        # ── Step 3.5: Update all-client memory bank ──
+        for local_idx, cid in enumerate(selected_ids):
+            self.all_client_updates[cid] = delta_weights_list[local_idx]
+
         # ── Step 4: Malicious scoring ──
         selected_history = [self.client_history[cid] for cid in selected_ids]
 
@@ -303,10 +312,18 @@ class ClientManager:
             delta_weights_list,
             selected_history,
             round_idx,
+            all_client_updates=self.all_client_updates,
+            selected_ids=selected_ids,
         )
 
         # Cập nhật lịch sử attacker (chỉ với clients được chọn)
-        updated_history = update_attacker_history(md_scores, selected_history)
+        md_feature_dim = int(delta_weights_list[0].size) if len(delta_weights_list) > 0 else 1
+        updated_history = update_attacker_history(
+            md_scores,
+            selected_history,
+            threshold_mode="chi2_95",
+            n_features=md_feature_dim,
+        )
         for local_idx, cid in enumerate(selected_ids):
             self.client_history[cid] = updated_history[local_idx]
 

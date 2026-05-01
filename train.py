@@ -53,6 +53,27 @@ def reduce_updates_with_pca(delta_updates, output_dim):
     return [x_reduced[i] for i in range(x_reduced.shape[0])]
 
 
+def transform_updates_with_pca(delta_updates, pca_model, output_dim):
+    """
+    Transform updates bằng PCA đã fit trước đó (KHÔNG refit mỗi round).
+    Luôn trả về vector có chiều cố định output_dim.
+    """
+    if len(delta_updates) == 0:
+        return []
+
+    x = np.stack(delta_updates).astype(np.float32)
+    x_reduced = pca_model.transform(x).astype(np.float32)
+
+    curr_dim = x_reduced.shape[1]
+    if curr_dim < output_dim:
+        pad = np.zeros((x_reduced.shape[0], output_dim - curr_dim), dtype=np.float32)
+        x_reduced = np.concatenate([x_reduced, pad], axis=1)
+    elif curr_dim > output_dim:
+        x_reduced = x_reduced[:, :output_dim]
+
+    return [x_reduced[i] for i in range(x_reduced.shape[0])]
+
+
 # =========================
 # ENTRY POINT
 # =========================
@@ -60,10 +81,10 @@ def reduce_updates_with_pca(delta_updates, output_dim):
 if __name__ == "__main__":
 
     # ── CONFIG ──────────────────────────────────────────────────────
-    NUM_USERS    = 20
+    NUM_USERS    = 100
     BATCH_SIZE   = 16
     LOCAL_EPOCH  = 2
-    PCA_COMPONENTS        = 20
+    PCA_COMPONENTS        = 50
     REPLAY_BUFFER_RANGE   = (5000, 10000)
     REPLAY_BUFFER_CAPACITY = 8000
 
@@ -79,6 +100,7 @@ if __name__ == "__main__":
     DQN_EPSILON_MIN     = 0.02
     DQN_WARMUP_STEPS    = 32
     DQN_TARGET_UPD_STEP = 10
+    PCA_WARMUP_ROUNDS   = 5
 
     # ── ATTACKER CONFIG ──────────────────────────────────────────────
     MALICIOUS_RATIO = 0.3         # 30% clients là attacker (paper: 5%-40%)
@@ -155,6 +177,7 @@ if __name__ == "__main__":
     print(f"ROUNDS:          {ROUNDS}")
     print(f"PCA_COMPONENTS:  {PCA_COMPONENTS}")
     print(f"REPLAY_BUFFER:   {REPLAY_BUFFER_RANGE[0]}~{REPLAY_BUFFER_RANGE[1]} (using {REPLAY_BUFFER_CAPACITY})")
+    print(f"PCA warmup:      fit-once after round {PCA_WARMUP_ROUNDS}")
     print(
         f"DQN cfg:         batch={DQN_BATCH_SIZE}, gamma={DQN_GAMMA}, "
         f"eps=({DQN_EPSILON_START}->{DQN_EPSILON_MIN}, decay={DQN_EPSILON_DECAY}), "
@@ -187,10 +210,11 @@ if __name__ == "__main__":
     )
 
     # ── INIT DQN ─────────────────────────────────────────────────────
-    state_dim = NUM_CLIENTS * (PCA_COMPONENTS + 2) + 1
+    # Per-client state feature dim: PCA update + data ratio + malicious score + global acc.
+    client_state_dim = PCA_COMPONENTS + 3
 
     dqn = DQNAgent(
-        state_dim=state_dim,
+        state_dim=client_state_dim,
         num_clients=NUM_CLIENTS,
         select_ratio=0.5,
         device=DQN_DEVICE,
@@ -208,12 +232,16 @@ if __name__ == "__main__":
 
     # ── TRAIN LOOP INIT ──────────────────────────────────────────────
     prev_acc      = 0.0
-    prev_reward   = 0.0
-    current_state = np.zeros(state_dim, dtype=np.float32)
+    prev_rewards  = np.zeros(NUM_CLIENTS, dtype=np.float32)
+    current_state = np.zeros((NUM_CLIENTS, client_state_dim), dtype=np.float32)
+    reward_history_list = []
 
     all_weights          = [np.zeros(PCA_COMPONENTS, dtype=np.float32) for _ in range(NUM_CLIENTS)]
     all_data_sizes       = [0.0] * NUM_CLIENTS
     all_malicious_scores = [0.0] * NUM_CLIENTS
+    all_full_deltas      = [None] * NUM_CLIENTS
+
+    pca_fitted = None
 
     round_bar     = tqdm(range(1, ROUNDS + 1), desc="Training Rounds", unit="round")
     avg_round_sec = None
@@ -294,7 +322,33 @@ if __name__ == "__main__":
             malicious_scores.append(float(u["malicious_score"]))
             client_ids.append(int(u["client_id"]))
 
-        weights_list = reduce_updates_with_pca(full_delta_list, PCA_COMPONENTS)
+        # Cập nhật memory bank full-dim deltas cho tất cả clients.
+        for i, cid in enumerate(client_ids):
+            all_full_deltas[cid] = full_delta_list[i]
+
+        # Fit PCA MỘT LẦN sau warmup rounds bằng full memory bank (all clients).
+        if pca_fitted is None and round_idx >= PCA_WARMUP_ROUNDS:
+            bank = [v for v in all_full_deltas if v is not None]
+            if len(bank) >= PCA_COMPONENTS:
+                x_bank = np.stack(bank).astype(np.float32)
+                n_features = x_bank.shape[1]
+                n_comp = min(PCA_COMPONENTS, x_bank.shape[0], n_features)
+                if n_comp >= 1:
+                    pca_fitted = PCA(
+                        n_components=n_comp,
+                        svd_solver="randomized",
+                        random_state=42,
+                    )
+                    pca_fitted.fit(x_bank)
+                    tqdm.write(
+                        f"[PCA] Fitted once at round {round_idx} "
+                        f"with {x_bank.shape[0]} samples, n_components={n_comp}"
+                    )
+
+        if pca_fitted is not None:
+            weights_list = transform_updates_with_pca(full_delta_list, pca_fitted, PCA_COMPONENTS)
+        else:
+            weights_list = reduce_updates_with_pca(full_delta_list, PCA_COMPONENTS)
 
         for i, cid in enumerate(client_ids):
             all_weights[cid]          = weights_list[i]
@@ -310,16 +364,47 @@ if __name__ == "__main__":
         )
 
         # ── REWARD (Eq. 15-18) ───────────────────────────────────────
-        # Dùng cùng một global reference vector cho mỗi local delta để
-        # compute_reward so sánh theo cặp vector-vector (không bị zip với scalar).
+        # Khôi phục local absolute: theta_l = theta_g + delta_l trước khi tính distance.
+        local_abs_list = [global_flat + delta for delta in full_delta_list]
+        # Dùng cùng một global reference vector cho mỗi local absolute vector.
         global_refs = [global_flat for _ in range(len(full_delta_list))]
         reward = dqn.compute_reward(
-            prev_reward,
-            full_delta_list,
+            prev_rewards,
+            selected_ids,
+            local_abs_list,
             global_refs,
             feedback["round_accuracy"],
             feedback["prev_accuracy"],
             feedback["malicious_scores"],
+        )
+
+        # Episode total reward: chỉ cộng rewards của clients được chọn trong round.
+        episode_total_reward = float(np.sum(np.asarray(reward, dtype=np.float32)[selected_ids]))
+        reward_history_list.append(episode_total_reward)
+
+        # ── REWARD LOG (per-client + group means) ─────────────────────
+        _rw_arr = np.asarray(reward, dtype=np.float32)
+        _per_client_lines = []
+        _ben_rewards = []
+        _mal_rewards = []
+        for cid in range(NUM_CLIENTS):
+            rw_i = float(_rw_arr[cid])
+            tag  = "[M]" if clients[cid].is_malicious else "[B]"
+            sel  = "*" if cid in selected_set else " "
+            _per_client_lines.append(f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f}")
+            if clients[cid].is_malicious:
+                _mal_rewards.append(rw_i)
+            else:
+                _ben_rewards.append(rw_i)
+        _mean_ben = float(np.mean(_ben_rewards)) if _ben_rewards else 0.0
+        _mean_mal = float(np.mean(_mal_rewards)) if _mal_rewards else 0.0
+        _gap      = _mean_ben - _mean_mal
+        tqdm.write("--- Per-Client Reward ---")
+        for line in _per_client_lines:
+            tqdm.write(line)
+        tqdm.write(
+            f"--- AVG  rw_benign={_mean_ben:+.4f}  rw_malicious={_mean_mal:+.4f}  "
+            f"gap(B-M)={_gap:+.4f} {'OK' if _gap > 0 else 'BAD'} ---"
         )
 
         # ── DQN UPDATE ───────────────────────────────────────────────
@@ -328,7 +413,6 @@ if __name__ == "__main__":
             action=selected_ids,
             reward=reward,
             next_state=next_state,
-            done=(round_idx == ROUNDS),
         )
         dqn_loss = dqn.train(batch_size=DQN_BATCH_SIZE)
 
@@ -339,7 +423,7 @@ if __name__ == "__main__":
         writer.add_scalar("FL/accuracy_delta",    global_acc - prev_acc, round_idx)
 
         # 2) DQN / RL
-        writer.add_scalar("DQN/reward",           reward,            round_idx)
+        writer.add_scalar("DQN/episode_total_reward", episode_total_reward, round_idx)
         writer.add_scalar("DQN/epsilon",          dqn.epsilon,       round_idx)
         writer.add_scalar("DQN/replay_size",      len(dqn.memory),   round_idx)
         writer.add_scalar("DQN/q_min",            selection_info["q_min"], round_idx)
@@ -389,7 +473,7 @@ if __name__ == "__main__":
         tqdm.write(dqn_info)
         tqdm.write(
             f"Round {round_idx:02d} | time={round_sec:.1f}s | "
-            f"acc={global_acc:.4f} | loss={global_loss:.4f} | rw={reward:.4f} | "
+            f"acc={global_acc:.4f} | loss={global_loss:.4f} | rw_sum={episode_total_reward:.4f} | "
             f"TPR={tpr:.2f} | FPR={fpr:.2f} | "
             f"mal_in_sel={len(mal_selected)}/{num_malicious} | "
             f"atk_ratio={attacker_sel_ratio:.2f} | "
@@ -399,7 +483,7 @@ if __name__ == "__main__":
         round_bar.set_postfix(
             acc  = f"{global_acc:.4f}",
             gl   = f"{global_loss:.4f}",
-            rw   = f"{reward:.4f}",
+            rw   = f"{episode_total_reward:.4f}",
             dqn  = f"{dqn_loss:.4f}" if dqn_loss is not None else "warmup",
             eps  = f"{dqn.epsilon:.4f}",
             TPR  = f"{tpr:.2f}",
@@ -407,7 +491,7 @@ if __name__ == "__main__":
         )
 
         prev_acc      = global_acc
-        prev_reward   = reward
+        prev_rewards  = np.asarray(reward, dtype=np.float32)
         current_state = next_state
 
     # ── FINAL SUMMARY ────────────────────────────────────────────────
