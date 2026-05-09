@@ -453,16 +453,20 @@ class DQNAgent:
         # Q_main(s_t) có shape (B, N)
         q_values = self.primary_q_net(states)
 
-        # Q_target(s_{t+1}) có shape (B, N)
+        # Bellman target đúng cho top-P selection:
+        # target_i = r_i + γ * mean(top-P Q(s'))  — shared bootstrap signal
+        # Chỉ tính loss trên clients được chọn (action_mask == 1)
         with torch.no_grad():
-            next_q_all = self.target_q_net(next_states)
-            # Không reduce theo batch dimension để tránh trộn temporal giữa các samples.
-            # target_q giữ nguyên shape (B, N) theo từng experience và từng client.
-            target_q = rewards + self.gamma * next_q_all
+            next_q_all = self.target_q_net(next_states)           # (B, N)
+            top_p_vals, _ = torch.topk(next_q_all, self.select_num, dim=1)  # (B, P)
+            next_q_bootstrap = top_p_vals.mean(dim=1, keepdim=True)         # (B, 1)
+            # Broadcast: tất cả selected clients nhận cùng bootstrap value
+            target_q = rewards + self.gamma * next_q_bootstrap.expand_as(rewards)  # (B, N)
 
-        # Loss element-wise trên (B, N), sau đó mới mean để backprop.
-        loss_matrix = nn.MSELoss(reduction="none")(q_values, target_q)
-        loss = loss_matrix.mean()
+        # Chỉ tính loss trên clients được chọn (action_mask == 1)
+        loss_matrix = nn.MSELoss(reduction="none")(q_values, target_q)   # (B, N)
+        masked_loss = (loss_matrix * action_masks).sum() / (action_masks.sum() + 1e-8)
+        loss = masked_loss
 
         self.optimizer.zero_grad()
         loss.backward()
