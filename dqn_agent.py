@@ -342,8 +342,8 @@ class DQNAgent:
                        prev_acc,
                        malicious_scores,
                        alpha=0.2,
-                       beta=0.3,
-                       lam=0.5):
+                       beta=0.5,
+                       lam=0.3):
 
         # Reward vector R_t với shape [N]
         eps = 1e-8
@@ -389,10 +389,10 @@ class DQNAgent:
             diff = (lw - gw) / (np.abs(gw) + eps)
             dist_i = float(np.sum(np.abs(diff)) / pn)
 
-            acc_delta = float(global_acc - prev_acc)
-            # exp(-dist): benign (dist nhỏ) → ~1.0, malicious (dist lớn) → ~0
-            # acc_delta bonus: chỉ thưởng thêm khi accuracy cải thiện
-            utility_i = float(np.exp(-dist_i) * (1.0 + max(0.0, acc_delta)))
+            if global_acc > prev_acc:
+                utility_i = float(np.exp(-dist_i) + global_acc)  # Eq.(16) case 1
+            else:
+                utility_i = float(1.0 - np.exp(-dist_i))          # Eq.(16) case 2
 
             # Use RAW malicious score (no min-max normalization) to avoid
             # collapsing penalty signal when selected scores are close.

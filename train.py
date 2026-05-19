@@ -5,6 +5,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import torch
 import numpy as np
 import time
+import sys
 import datetime
 import pickle
 from argparse import ArgumentParser
@@ -90,6 +91,7 @@ def save_checkpoint(path, round_idx, server, dqn, client_manager,
         "best_acc":             best_acc,
         "run_name":             run_name,
         "log_dir":              log_dir,
+        "save_dir":             os.path.dirname(path),  # folder chua checkpoint nay
     }
     tmp_path = path + ".tmp"
     torch.save(checkpoint, tmp_path)
@@ -170,7 +172,7 @@ if __name__ == "__main__":
     BATCH_SIZE   = args.batch_size
     LOCAL_EPOCH  = args.local_epoch
     PCA_COMPONENTS        = 50
-    REPLAY_BUFFER_CAPACITY = 8000
+    REPLAY_BUFFER_CAPACITY = 300
 
     NUM_CLIENTS   = NUM_USERS
     ROUNDS        = args.rounds  # 0 = unlimited
@@ -182,9 +184,9 @@ if __name__ == "__main__":
     DQN_EPSILON_START   = 1.0
     DQN_EPSILON_DECAY   = 0.97
     DQN_EPSILON_MIN     = 0.02
-    DQN_WARMUP_STEPS    = 32
+    DQN_WARMUP_STEPS    = 50
     DQN_TARGET_UPD_STEP = 10
-    PCA_WARMUP_ROUNDS   = 5
+    PCA_WARMUP_ROUNDS   = 10
 
     # -- ATTACKER CONFIG -----------------------------------------------------
     MALICIOUS_RATIO = args.malicious_ratio
@@ -195,6 +197,17 @@ if __name__ == "__main__":
 
     SAVE_DIR   = args.save_dir
     SAVE_EVERY = args.save_every
+    # Khi chay moi (khong resume), tu dong tao subfolder theo timestamp
+    # de tranh ghi de checkpoint cu.
+    if not args.checkpoint:
+        _rounds_str = "inf" if ROUNDS == 0 else str(ROUNDS)
+        _run_tag = (
+            f"{DATASET}_N{NUM_CLIENTS}_"
+            f"mal{int(MALICIOUS_RATIO*100)}pct_{ATTACK_TYPE}_"
+            f"ep{LOCAL_EPOCH}_r{_rounds_str}_"
+            f"{datetime.datetime.now().strftime('%m%d_%H%M')}"
+        )
+        SAVE_DIR = os.path.join(SAVE_DIR, _run_tag)
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     # -- DATASET -------------------------------------------------------------
@@ -293,6 +306,11 @@ if __name__ == "__main__":
                 malicious_ids   = set(ckpt["malicious_ids"])
             run_name            = ckpt.get("run_name", run_name)
             log_dir             = ckpt.get("log_dir", log_dir)
+            # Restore save_dir → checkpoint tiep tuc luu vao dung folder cu
+            _ckpt_save_dir = ckpt.get("save_dir") or os.path.dirname(os.path.abspath(_attempt))
+            if _ckpt_save_dir and os.path.isdir(_ckpt_save_dir):
+                SAVE_DIR = _ckpt_save_dir
+                print(f"[RESUME] save_dir restored: {SAVE_DIR}")
 
             # Restore list fields — validate length matches NUM_CLIENTS
             _ckpt_aw = ckpt.get("all_weights", [])
@@ -358,15 +376,19 @@ if __name__ == "__main__":
         # Unlimited: count up from start_round
         round_iter = iter(range(start_round, 999999))
         round_bar  = tqdm(round_iter, desc="Training Rounds", unit="round",
-                          initial=start_round - 1)
+                          initial=start_round - 1, disable=True,
+                          dynamic_ncols=False, position=0, leave=True,
+                          file=sys.stderr)
     else:
         round_bar = tqdm(range(start_round, ROUNDS + 1), desc="Training Rounds", unit="round",
-                         initial=start_round - 1, total=ROUNDS)
+                         initial=start_round - 1, total=ROUNDS, disable=True,
+                         dynamic_ncols=False, position=0, leave=True,
+                         file=sys.stderr)
 
     try:
         for round_idx in round_bar:
             round_start = time.perf_counter()
-            tqdm.write(f"\n========== ROUND {round_idx} ==========")
+            print(f"\n========== ROUND {round_idx} ==========")
 
             global_weights = server.broadcast_model()
             global_flat    = flatten_weights(global_weights)
@@ -433,7 +455,7 @@ if __name__ == "__main__":
                     if n_comp >= 1:
                         pca_fitted = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
                         pca_fitted.fit(x_bank)
-                        tqdm.write(f"[PCA] Fitted at round {round_idx} ({x_bank.shape[0]} samples, {n_comp} components)")
+                        print(f"[PCA] Fitted at round {round_idx} ({x_bank.shape[0]} samples, {n_comp} components)")
 
             if pca_fitted is not None:
                 weights_list = transform_updates_with_pca(full_delta_list, pca_fitted, PCA_COMPONENTS)
@@ -478,10 +500,10 @@ if __name__ == "__main__":
             _mean_ben = float(np.mean(_ben_rewards)) if _ben_rewards else 0.0
             _mean_mal = float(np.mean(_mal_rewards)) if _mal_rewards else 0.0
             _gap      = _mean_ben - _mean_mal
-            tqdm.write("--- Per-Client Reward ---")
+            print("--- Per-Client Reward ---")
             for line in _per_client_lines:
-                tqdm.write(line)
-            tqdm.write(
+                print(line)
+            print(
                 f"--- AVG  rw_benign={_mean_ben:+.4f}  rw_malicious={_mean_mal:+.4f}  "
                 f"gap(B-M)={_gap:+.4f} {'OK' if _gap > 0 else 'BAD'} ---"
             )
@@ -518,8 +540,8 @@ if __name__ == "__main__":
             else:
                 dqn_info = f"DQN Loss: warming up ({replay_size}/{max(DQN_BATCH_SIZE, DQN_WARMUP_STEPS)}) | Epsilon: {dqn.epsilon:.4f}"
 
-            tqdm.write(dqn_info)
-            tqdm.write(
+            print(dqn_info)
+            print(
                 f"Round {round_idx:03d} | time={round_sec:.1f}s | "
                 f"acc={global_acc:.4f} | loss={global_loss:.4f} | rw_sum={episode_total_reward:.4f} | "
                 f"rw_ben={_mean_ben:+.4f} | rw_mal={_mean_mal:+.4f} | "
@@ -559,7 +581,7 @@ if __name__ == "__main__":
                 )
 
     except KeyboardInterrupt:
-        tqdm.write(f"\n[INFO] Ctrl+C detected at round {round_idx} -- saving checkpoint before exit...")
+        print(f"\n[INFO] Ctrl+C detected at round {round_idx} -- saving checkpoint before exit...")
 
     finally:
         # Luon save khi ket thuc (du hoan thanh hay Ctrl+C)
