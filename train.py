@@ -156,6 +156,10 @@ def get_args():
     parser.add_argument("--malicious-ratio", type=float, default=0.3)
     parser.add_argument("--local-epoch", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--mode", type=str, default="feddrlpd",
+                        choices=["feddrlpd", "fedavg"],
+                        help="feddrlpd: DQN-based client selection (default); "
+                             "fedavg: all clients every round, no DQN")
     return parser.parse_args()
 
 
@@ -171,6 +175,7 @@ if __name__ == "__main__":
     NUM_USERS    = args.num_clients
     BATCH_SIZE   = args.batch_size
     LOCAL_EPOCH  = args.local_epoch
+    MODE         = args.mode          # "feddrlpd" | "fedavg"
     PCA_COMPONENTS        = 50
     REPLAY_BUFFER_CAPACITY = 300
 
@@ -202,7 +207,7 @@ if __name__ == "__main__":
     if not args.checkpoint:
         _rounds_str = "inf" if ROUNDS == 0 else str(ROUNDS)
         _run_tag = (
-            f"{DATASET}_N{NUM_CLIENTS}_"
+            f"{MODE}_{DATASET}_N{NUM_CLIENTS}_"
             f"mal{int(MALICIOUS_RATIO*100)}pct_{ATTACK_TYPE}_"
             f"ep{LOCAL_EPOCH}_r{_rounds_str}_"
             f"{datetime.datetime.now().strftime('%m%d_%H%M')}"
@@ -266,7 +271,7 @@ if __name__ == "__main__":
 
     # -- TENSORBOARD ---------------------------------------------------------
     run_name = (
-        f"{DATASET}_N{NUM_CLIENTS}_"
+        f"{MODE}_{DATASET}_N{NUM_CLIENTS}_"
         f"mal{int(MALICIOUS_RATIO*100)}pct_{ATTACK_TYPE}_"
         f"ep{LOCAL_EPOCH}_r{'inf' if ROUNDS == 0 else ROUNDS}_"
         f"{datetime.datetime.now().strftime('%m%d_%H%M')}"
@@ -346,8 +351,11 @@ if __name__ == "__main__":
     print(f"\nTensorBoard logs -> {log_dir}")
     print(f"  Xem bang lenh: tensorboard --logdir runs")
     print(f"\n=== Runtime Config ===")
-    print(f"DEVICE: {DEVICE} | CLIENTS: {NUM_CLIENTS} | ROUNDS: {rounds_str} | EPOCH: {LOCAL_EPOCH}")
-    print(f"DQN: eps_decay={DQN_EPSILON_DECAY}, warmup={DQN_WARMUP_STEPS}, batch={DQN_BATCH_SIZE}")
+    print(f"MODE: {MODE.upper()} | DEVICE: {DEVICE} | CLIENTS: {NUM_CLIENTS} | ROUNDS: {rounds_str} | EPOCH: {LOCAL_EPOCH}")
+    if MODE == "feddrlpd":
+        print(f"DQN: eps_decay={DQN_EPSILON_DECAY}, warmup={DQN_WARMUP_STEPS}, batch={DQN_BATCH_SIZE}")
+    else:
+        print("FedAvg mode: all clients selected every round, DQN/PCA/reward disabled")
     print(f"Checkpoint: save to {SAVE_DIR}/ every {SAVE_EVERY} rounds")
     print(f"\n=== Attacker Setup ===")
     print(f"MALICIOUS_RATIO: {MALICIOUS_RATIO} ({num_malicious}/{NUM_CLIENTS})")
@@ -355,6 +363,7 @@ if __name__ == "__main__":
     print(f"Attacker IDs:    {sorted(malicious_ids)}")
 
     writer.add_text("config/dataset",       DATASET,                    0)
+    writer.add_text("config/mode",          MODE,                       0)
     writer.add_text("config/attack_type",   ATTACK_TYPE,                0)
     writer.add_text("config/malicious_ids", str(sorted(malicious_ids)), 0)
     writer.add_hparams(
@@ -362,7 +371,7 @@ if __name__ == "__main__":
             "num_clients": NUM_CLIENTS, "malicious_ratio": MALICIOUS_RATIO,
             "attack_type": ATTACK_TYPE, "local_epoch": LOCAL_EPOCH,
             "rounds": ROUNDS, "batch_size": BATCH_SIZE,
-            "pca_components": PCA_COMPONENTS, "iid": IID,
+            "pca_components": PCA_COMPONENTS, "iid": IID, "mode": MODE,
         },
         metric_dict={"hparam/final_acc": 0.0},
     )
@@ -393,187 +402,236 @@ if __name__ == "__main__":
             global_weights = server.broadcast_model()
             global_flat    = flatten_weights(global_weights)
 
-            if round_idx == 1:
+            # ================================================================
+            # MODE BRANCH — FedAvg: tất cả client, không DQN
+            # ================================================================
+            if MODE == "fedavg":
                 selected_ids = list(range(NUM_CLIENTS))
-                q_stats = dqn.get_q_stats(current_state)
-                selection_info = {
-                    "epsilon": float(dqn.epsilon), "mode": "bootstrap_all_clients",
-                    "random_count": 0, "greedy_count": NUM_CLIENTS,
-                    "selected_q_mean": q_stats["q_mean"], **q_stats,
-                }
-            else:
-                selected_ids_np, selection_info = dqn.select_action(current_state, return_info=True)
-                selected_ids = [int(i) for i in selected_ids_np.tolist()]
 
-            updates_pack = client_manager.train_clients(
-                global_weights, round_idx,
-                local_epochs=LOCAL_EPOCH, selected_ids=selected_ids,
-            )
-            updates          = updates_pack["updates"]
-            selected_ids     = updates_pack["selected_ids"]
-            trained_clients  = len(selected_ids)
-            selected_samples = int(sum(u["data_size"] for u in updates))
+                updates_pack = client_manager.train_clients(
+                    global_weights, round_idx,
+                    local_epochs=LOCAL_EPOCH, selected_ids=selected_ids,
+                )
+                updates      = updates_pack["updates"]
+                selected_ids = updates_pack["selected_ids"]
 
-            result      = server.training_round(updates_pack)
-            global_acc  = result["accuracy"]
-            global_loss = result["loss"]
-            feedback    = result["dqn_feedback"]
+                result      = server.training_round(updates_pack)
+                global_acc  = result["accuracy"]
+                global_loss = result["loss"]
 
-            # Detection metrics
-            selected_set       = set(selected_ids)
-            mal_selected       = [i for i in selected_ids if i in malicious_ids]
-            ben_selected       = [i for i in selected_ids if i not in malicious_ids]
-            attacker_sel_ratio = len(mal_selected) / max(1, trained_clients)
-            random_pick_ratio  = selection_info["random_count"] / max(1, trained_clients)
-            detected_mal       = len([i for i in malicious_ids if i not in selected_set])
-            missed_mal         = len(mal_selected)
-            false_excl         = len([i for i in range(NUM_CLIENTS)
-                                      if i not in malicious_ids and i not in selected_set])
-            tpr = detected_mal / max(1, num_malicious)
-            fpr = false_excl   / max(1, NUM_CLIENTS - num_malicious)
+                # Detection metrics (chỉ để log — fedavg không defense)
+                selected_set    = set(selected_ids)
+                mal_selected    = [i for i in selected_ids if i in malicious_ids]
+                trained_clients = len(selected_ids)
+                tpr = 0.0   # không có defense → không phát hiện ai
+                fpr = 0.0
 
-            # Build next state
-            full_delta_list  = []
-            data_sizes       = []
-            malicious_scores = []
-            client_ids       = []
+                round_sec = time.perf_counter() - round_start
+                avg_round_sec = round_sec if avg_round_sec is None else 0.9 * avg_round_sec + 0.1 * round_sec
 
-            for u in updates:
-                full_delta_list.append(flatten_weights(u["weights"]).astype(np.float32))
-                data_sizes.append(float(u["data_size"]))
-                malicious_scores.append(float(u["malicious_score"]))
-                client_ids.append(int(u["client_id"]))
+                # TensorBoard
+                writer.add_scalar("FL/global_accuracy", global_acc,  round_idx)
+                writer.add_scalar("FL/global_loss",     global_loss, round_idx)
+                writer.add_scalar("FL/accuracy_delta",  global_acc - prev_acc, round_idx)
+                writer.add_scalar("Selection/malicious_in_sel", len(mal_selected), round_idx)
 
-            # Debug MD scores moi 10 rounds
-            if round_idx % 10 == 0:
-                _md_ben, _md_mal = [], []
-                for i, cid in enumerate(client_ids):
-                    md_raw = float(malicious_scores[i])  # = Att_p * MD, chia de lay MD
-                    att_p  = 1.0 + client_manager.client_history[cid] / max(1, round_idx)
-                    md_val = md_raw / max(att_p, 1e-8)
-                    if cid in malicious_ids:
-                        _md_mal.append(md_val)
-                    else:
-                        _md_ben.append(md_val)
-                _str  = f"[MD Debug] round={round_idx}"
-                _str += f" | benign  MD: mean={np.mean(_md_ben):.2f} max={np.max(_md_ben):.2f}" if _md_ben else " | benign  MD: N/A"
-                _str += f" | malicious MD: mean={np.mean(_md_mal):.2f} max={np.max(_md_mal):.2f}" if _md_mal else " | malicious MD: N/A"
-                print(_str)
+                print(
+                    f"Round {round_idx:03d} | time={round_sec:.1f}s | "
+                    f"acc={global_acc:.4f} | loss={global_loss:.4f} | "
+                    f"clients={trained_clients} | mal_in_sel={len(mal_selected)}/{num_malicious}"
+                )
+                round_bar.set_postfix(
+                    acc=f"{global_acc:.4f}",
+                    loss=f"{global_loss:.4f}",
+                )
 
-            for i, cid in enumerate(client_ids):
-                all_full_deltas[cid] = full_delta_list[i]
+                prev_acc = global_acc
 
-            if pca_fitted is None and round_idx >= PCA_WARMUP_ROUNDS:
-                bank = [v for v in all_full_deltas if v is not None]
-                if len(bank) >= PCA_COMPONENTS:
-                    x_bank = np.stack(bank).astype(np.float32)
-                    n_comp = min(PCA_COMPONENTS, x_bank.shape[0], x_bank.shape[1])
-                    if n_comp >= 1:
-                        pca_fitted = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
-                        pca_fitted.fit(x_bank)
-                        print(f"[PCA] Fitted at round {round_idx} ({x_bank.shape[0]} samples, {n_comp} components)")
-
-            if pca_fitted is not None:
-                weights_list = transform_updates_with_pca(full_delta_list, pca_fitted, PCA_COMPONENTS)
-            else:
-                weights_list = reduce_updates_with_pca(full_delta_list, PCA_COMPONENTS)
-
-            for i, cid in enumerate(client_ids):
-                all_weights[cid]          = weights_list[i]
-                all_data_sizes[cid]       = data_sizes[i]
-                all_malicious_scores[cid] = malicious_scores[i]
-
-            next_state = dqn.build_state(
-                all_weights, all_data_sizes, all_malicious_scores, global_acc,
-                client_ids=list(range(NUM_CLIENTS)),
-            )
-
-            # Reward
-            local_abs_list = [global_flat + delta for delta in full_delta_list]
-            global_refs    = [global_flat for _ in range(len(full_delta_list))]
-            reward = dqn.compute_reward(
-                prev_rewards, selected_ids, local_abs_list, global_refs,
-                feedback["round_accuracy"], feedback["prev_accuracy"], feedback["malicious_scores"],
-            )
-
-            episode_total_reward = float(np.sum(np.asarray(reward, dtype=np.float32)[selected_ids]))
-            reward_history_list.append(episode_total_reward)
-
-            # Reward log
-            _rw_arr = np.asarray(reward, dtype=np.float32)
-            _per_client_lines = []
-            _ben_rewards = []
-            _mal_rewards = []
-            for cid in range(NUM_CLIENTS):
-                rw_i = float(_rw_arr[cid])
-                tag  = "[M]" if clients[cid].is_malicious else "[B]"
-                sel  = "*" if cid in selected_set else " "
-                m_i  = float(all_malicious_scores[cid])
-                _per_client_lines.append(f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f}")
-                if clients[cid].is_malicious:
-                    _mal_rewards.append(rw_i)
+            # ================================================================
+            # MODE BRANCH — FedDRLPD: DQN client selection (logic cũ)
+            # ================================================================
+            else:  # MODE == "feddrlpd"
+                if round_idx == 1:
+                    selected_ids = list(range(NUM_CLIENTS))
+                    q_stats = dqn.get_q_stats(current_state)
+                    selection_info = {
+                        "epsilon": float(dqn.epsilon), "mode": "bootstrap_all_clients",
+                        "random_count": 0, "greedy_count": NUM_CLIENTS,
+                        "selected_q_mean": q_stats["q_mean"], **q_stats,
+                    }
                 else:
-                    _ben_rewards.append(rw_i)
-            _mean_ben = float(np.mean(_ben_rewards)) if _ben_rewards else 0.0
-            _mean_mal = float(np.mean(_mal_rewards)) if _mal_rewards else 0.0
-            _gap      = _mean_ben - _mean_mal
-            print("--- Per-Client Reward ---")
-            for line in _per_client_lines:
-                print(line)
-            print(
-                f"--- AVG  rw_benign={_mean_ben:+.4f}  rw_malicious={_mean_mal:+.4f}  "
-                f"gap(B-M)={_gap:+.4f} {'OK' if _gap > 0 else 'BAD'} ---"
-            )
+                    selected_ids_np, selection_info = dqn.select_action(current_state, return_info=True)
+                    selected_ids = [int(i) for i in selected_ids_np.tolist()]
 
-            # DQN update
-            dqn.update_transition(curr_state=current_state, action=selected_ids,
-                                  reward=reward, next_state=next_state)
-            dqn_loss = dqn.train(batch_size=DQN_BATCH_SIZE)
+                updates_pack = client_manager.train_clients(
+                    global_weights, round_idx,
+                    local_epochs=LOCAL_EPOCH, selected_ids=selected_ids,
+                )
+                updates          = updates_pack["updates"]
+                selected_ids     = updates_pack["selected_ids"]
+                trained_clients  = len(selected_ids)
+                selected_samples = int(sum(u["data_size"] for u in updates))
 
-            # TensorBoard
-            writer.add_scalar("FL/global_accuracy",        global_acc,           round_idx)
-            writer.add_scalar("FL/global_loss",            global_loss,          round_idx)
-            writer.add_scalar("FL/accuracy_delta",         global_acc - prev_acc, round_idx)
-            writer.add_scalar("DQN/episode_total_reward",  episode_total_reward, round_idx)
-            writer.add_scalar("DQN/epsilon",               dqn.epsilon,          round_idx)
-            writer.add_scalar("DQN/replay_size",           len(dqn.memory),      round_idx)
-            writer.add_scalar("DQN/q_mean",                selection_info["q_mean"], round_idx)
-            if dqn_loss is not None:
-                writer.add_scalar("DQN/loss", dqn_loss, round_idx)
-            writer.add_scalar("Defense/TPR",               tpr,                  round_idx)
-            writer.add_scalar("Defense/FPR",               fpr,                  round_idx)
-            writer.add_scalar("Selection/malicious_in_sel", len(mal_selected),   round_idx)
-            writer.add_scalar("Selection/attacker_ratio",  attacker_sel_ratio,   round_idx)
+                result      = server.training_round(updates_pack)
+                global_acc  = result["accuracy"]
+                global_loss = result["loss"]
+                feedback    = result["dqn_feedback"]
 
-            # Console
-            replay_size = len(dqn.memory)
-            round_sec   = time.perf_counter() - round_start
-            avg_round_sec = round_sec if avg_round_sec is None else 0.9 * avg_round_sec + 0.1 * round_sec
-            eta_rounds = (ROUNDS - round_idx) if ROUNDS > 0 else 0
-            eta_sec = max(0.0, eta_rounds * avg_round_sec)
+                # Detection metrics
+                selected_set       = set(selected_ids)
+                mal_selected       = [i for i in selected_ids if i in malicious_ids]
+                ben_selected       = [i for i in selected_ids if i not in malicious_ids]
+                attacker_sel_ratio = len(mal_selected) / max(1, trained_clients)
+                random_pick_ratio  = selection_info["random_count"] / max(1, trained_clients)
+                detected_mal       = len([i for i in malicious_ids if i not in selected_set])
+                missed_mal         = len(mal_selected)
+                false_excl         = len([i for i in range(NUM_CLIENTS)
+                                          if i not in malicious_ids and i not in selected_set])
+                tpr = detected_mal / max(1, num_malicious)
+                fpr = false_excl   / max(1, NUM_CLIENTS - num_malicious)
 
-            if dqn_loss is not None:
-                dqn_info = f"DQN Loss: {dqn_loss:.6f} | Epsilon: {dqn.epsilon:.4f} | Replay: {replay_size}"
-            else:
-                dqn_info = f"DQN Loss: warming up ({replay_size}/{max(DQN_BATCH_SIZE, DQN_WARMUP_STEPS)}) | Epsilon: {dqn.epsilon:.4f}"
+                # Build next state
+                full_delta_list  = []
+                data_sizes       = []
+                malicious_scores = []
+                client_ids       = []
 
-            print(dqn_info)
-            print(
-                f"Round {round_idx:03d} | time={round_sec:.1f}s | "
-                f"acc={global_acc:.4f} | loss={global_loss:.4f} | rw_sum={episode_total_reward:.4f} | "
-                f"rw_ben={_mean_ben:+.4f} | rw_mal={_mean_mal:+.4f} | "
-                f"TPR={tpr:.2f} | FPR={fpr:.2f} | "
-                f"mal_in_sel={len(mal_selected)}/{num_malicious}"
-            )
-            round_bar.set_postfix(
-                acc=f"{global_acc:.4f}", rw=f"{episode_total_reward:.4f}",
-                dqn=f"{dqn_loss:.4f}" if dqn_loss is not None else "warmup",
-                eps=f"{dqn.epsilon:.4f}", TPR=f"{tpr:.2f}",
-            )
+                for u in updates:
+                    full_delta_list.append(flatten_weights(u["weights"]).astype(np.float32))
+                    data_sizes.append(float(u["data_size"]))
+                    malicious_scores.append(float(u["malicious_score"]))
+                    client_ids.append(int(u["client_id"]))
 
-            prev_acc      = global_acc
-            prev_rewards  = np.asarray(reward, dtype=np.float32)
-            current_state = next_state
+                # Debug MD scores moi 10 rounds
+                if round_idx % 10 == 0:
+                    _md_ben, _md_mal = [], []
+                    for i, cid in enumerate(client_ids):
+                        md_raw = float(malicious_scores[i])  # = Att_p * MD, chia de lay MD
+                        att_p  = 1.0 + client_manager.client_history[cid] / max(1, round_idx)
+                        md_val = md_raw / max(att_p, 1e-8)
+                        if cid in malicious_ids:
+                            _md_mal.append(md_val)
+                        else:
+                            _md_ben.append(md_val)
+                    _str  = f"[MD Debug] round={round_idx}"
+                    _str += f" | benign  MD: mean={np.mean(_md_ben):.2f} max={np.max(_md_ben):.2f}" if _md_ben else " | benign  MD: N/A"
+                    _str += f" | malicious MD: mean={np.mean(_md_mal):.2f} max={np.max(_md_mal):.2f}" if _md_mal else " | malicious MD: N/A"
+                    print(_str)
+
+                for i, cid in enumerate(client_ids):
+                    all_full_deltas[cid] = full_delta_list[i]
+
+                if pca_fitted is None and round_idx >= PCA_WARMUP_ROUNDS:
+                    bank = [v for v in all_full_deltas if v is not None]
+                    if len(bank) >= PCA_COMPONENTS:
+                        x_bank = np.stack(bank).astype(np.float32)
+                        n_comp = min(PCA_COMPONENTS, x_bank.shape[0], x_bank.shape[1])
+                        if n_comp >= 1:
+                            pca_fitted = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
+                            pca_fitted.fit(x_bank)
+                            print(f"[PCA] Fitted at round {round_idx} ({x_bank.shape[0]} samples, {n_comp} components)")
+
+                if pca_fitted is not None:
+                    weights_list = transform_updates_with_pca(full_delta_list, pca_fitted, PCA_COMPONENTS)
+                else:
+                    weights_list = reduce_updates_with_pca(full_delta_list, PCA_COMPONENTS)
+
+                for i, cid in enumerate(client_ids):
+                    all_weights[cid]          = weights_list[i]
+                    all_data_sizes[cid]       = data_sizes[i]
+                    all_malicious_scores[cid] = malicious_scores[i]
+
+                next_state = dqn.build_state(
+                    all_weights, all_data_sizes, all_malicious_scores, global_acc,
+                    client_ids=list(range(NUM_CLIENTS)),
+                )
+
+                # Reward
+                local_abs_list = [global_flat + delta for delta in full_delta_list]
+                global_refs    = [global_flat for _ in range(len(full_delta_list))]
+                reward = dqn.compute_reward(
+                    prev_rewards, selected_ids, local_abs_list, global_refs,
+                    feedback["round_accuracy"], feedback["prev_accuracy"], feedback["malicious_scores"],
+                )
+
+                episode_total_reward = float(np.sum(np.asarray(reward, dtype=np.float32)[selected_ids]))
+                reward_history_list.append(episode_total_reward)
+
+                # Reward log
+                _rw_arr = np.asarray(reward, dtype=np.float32)
+                _per_client_lines = []
+                _ben_rewards = []
+                _mal_rewards = []
+                for cid in range(NUM_CLIENTS):
+                    rw_i = float(_rw_arr[cid])
+                    tag  = "[M]" if clients[cid].is_malicious else "[B]"
+                    sel  = "*" if cid in selected_set else " "
+                    m_i  = float(all_malicious_scores[cid])
+                    _per_client_lines.append(f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f}")
+                    if clients[cid].is_malicious:
+                        _mal_rewards.append(rw_i)
+                    else:
+                        _ben_rewards.append(rw_i)
+                _mean_ben = float(np.mean(_ben_rewards)) if _ben_rewards else 0.0
+                _mean_mal = float(np.mean(_mal_rewards)) if _mal_rewards else 0.0
+                _gap      = _mean_ben - _mean_mal
+                print("--- Per-Client Reward ---")
+                for line in _per_client_lines:
+                    print(line)
+                print(
+                    f"--- AVG  rw_benign={_mean_ben:+.4f}  rw_malicious={_mean_mal:+.4f}  "
+                    f"gap(B-M)={_gap:+.4f} {'OK' if _gap > 0 else 'BAD'} ---"
+                )
+
+                # DQN update
+                dqn.update_transition(curr_state=current_state, action=selected_ids,
+                                      reward=reward, next_state=next_state)
+                dqn_loss = dqn.train(batch_size=DQN_BATCH_SIZE)
+
+                # TensorBoard
+                writer.add_scalar("FL/global_accuracy",        global_acc,           round_idx)
+                writer.add_scalar("FL/global_loss",            global_loss,          round_idx)
+                writer.add_scalar("FL/accuracy_delta",         global_acc - prev_acc, round_idx)
+                writer.add_scalar("DQN/episode_total_reward",  episode_total_reward, round_idx)
+                writer.add_scalar("DQN/epsilon",               dqn.epsilon,          round_idx)
+                writer.add_scalar("DQN/replay_size",           len(dqn.memory),      round_idx)
+                writer.add_scalar("DQN/q_mean",                selection_info["q_mean"], round_idx)
+                if dqn_loss is not None:
+                    writer.add_scalar("DQN/loss", dqn_loss, round_idx)
+                writer.add_scalar("Defense/TPR",               tpr,                  round_idx)
+                writer.add_scalar("Defense/FPR",               fpr,                  round_idx)
+                writer.add_scalar("Selection/malicious_in_sel", len(mal_selected),   round_idx)
+                writer.add_scalar("Selection/attacker_ratio",  attacker_sel_ratio,   round_idx)
+
+                # Console
+                replay_size = len(dqn.memory)
+                round_sec   = time.perf_counter() - round_start
+                avg_round_sec = round_sec if avg_round_sec is None else 0.9 * avg_round_sec + 0.1 * round_sec
+                eta_rounds = (ROUNDS - round_idx) if ROUNDS > 0 else 0
+                eta_sec = max(0.0, eta_rounds * avg_round_sec)
+
+                if dqn_loss is not None:
+                    dqn_info = f"DQN Loss: {dqn_loss:.6f} | Epsilon: {dqn.epsilon:.4f} | Replay: {replay_size}"
+                else:
+                    dqn_info = f"DQN Loss: warming up ({replay_size}/{max(DQN_BATCH_SIZE, DQN_WARMUP_STEPS)}) | Epsilon: {dqn.epsilon:.4f}"
+
+                print(dqn_info)
+                print(
+                    f"Round {round_idx:03d} | time={round_sec:.1f}s | "
+                    f"acc={global_acc:.4f} | loss={global_loss:.4f} | rw_sum={episode_total_reward:.4f} | "
+                    f"rw_ben={_mean_ben:+.4f} | rw_mal={_mean_mal:+.4f} | "
+                    f"TPR={tpr:.2f} | FPR={fpr:.2f} | "
+                    f"mal_in_sel={len(mal_selected)}/{num_malicious}"
+                )
+                round_bar.set_postfix(
+                    acc=f"{global_acc:.4f}", rw=f"{episode_total_reward:.4f}",
+                    dqn=f"{dqn_loss:.4f}" if dqn_loss is not None else "warmup",
+                    eps=f"{dqn.epsilon:.4f}", TPR=f"{tpr:.2f}",
+                )
+
+                prev_acc      = global_acc
+                prev_rewards  = np.asarray(reward, dtype=np.float32)
+                current_state = next_state
 
             # -- CHECKPOINT SAVE --
             # Save best
