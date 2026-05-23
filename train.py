@@ -182,7 +182,7 @@ if __name__ == "__main__":
     DQN_BATCH_SIZE      = 32
     DQN_GAMMA           = 0.95
     DQN_EPSILON_START   = 1.0
-    DQN_EPSILON_DECAY   = 0.97
+    DQN_EPSILON_DECAY   = 0.98
     DQN_EPSILON_MIN     = 0.02
     DQN_WARMUP_STEPS    = 50
     DQN_TARGET_UPD_STEP = 10
@@ -444,6 +444,22 @@ if __name__ == "__main__":
                 malicious_scores.append(float(u["malicious_score"]))
                 client_ids.append(int(u["client_id"]))
 
+            # Debug MD scores moi 10 rounds
+            if round_idx % 10 == 0:
+                _md_ben, _md_mal = [], []
+                for i, cid in enumerate(client_ids):
+                    md_raw = float(malicious_scores[i])  # = Att_p * MD, chia de lay MD
+                    att_p  = 1.0 + client_manager.client_history[cid] / max(1, round_idx)
+                    md_val = md_raw / max(att_p, 1e-8)
+                    if cid in malicious_ids:
+                        _md_mal.append(md_val)
+                    else:
+                        _md_ben.append(md_val)
+                _str  = f"[MD Debug] round={round_idx}"
+                _str += f" | benign  MD: mean={np.mean(_md_ben):.2f} max={np.max(_md_ben):.2f}" if _md_ben else " | benign  MD: N/A"
+                _str += f" | malicious MD: mean={np.mean(_md_mal):.2f} max={np.max(_md_mal):.2f}" if _md_mal else " | malicious MD: N/A"
+                print(_str)
+
             for i, cid in enumerate(client_ids):
                 all_full_deltas[cid] = full_delta_list[i]
 
@@ -492,7 +508,8 @@ if __name__ == "__main__":
                 rw_i = float(_rw_arr[cid])
                 tag  = "[M]" if clients[cid].is_malicious else "[B]"
                 sel  = "*" if cid in selected_set else " "
-                _per_client_lines.append(f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f}")
+                m_i  = float(all_malicious_scores[cid])
+                _per_client_lines.append(f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f}")
                 if clients[cid].is_malicious:
                     _mal_rewards.append(rw_i)
                 else:
