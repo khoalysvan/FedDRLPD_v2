@@ -128,6 +128,18 @@ class MaliciousClient(Client):
             images = self.add_trigger(images)
             labels[:] = 0  # target label
 
+        # --- Combined attacks: poisoning + large weight noise ---
+        # Goal: push weight delta further from benign distribution
+        # → higher Mahalanobis Distance → malicious score tăng → dễ detect hơn.
+        elif self.attack_type == "noise_label_flipping":
+            labels = (labels + 1) % 10  # label flip (data poisoning)
+            # weight noise is injected in train() after computing the delta
+
+        elif self.attack_type == "noise_backdoor":
+            images = self.add_trigger(images)  # backdoor trigger
+            labels[:] = 0                      # target label
+            # weight noise is injected in train() after computing the delta
+
         return images, labels
 
 
@@ -170,9 +182,15 @@ class MaliciousClient(Client):
         for key in new_state.keys():
             weight_update[key] = new_state[key] - prev_state[key]
 
-        # Additive noise attack
+        # Additive noise attack (standalone)
         if self.attack_type == "noise":
             weight_update = self.add_noise(weight_update)
+
+        # Combined poisoning + large weight noise:
+        # The extra noise pushes the delta further from the benign distribution
+        # → higher MD score → malicious score m_i tăng → easier for DQN to detect.
+        elif self.attack_type in ("noise_label_flipping", "noise_backdoor"):
+            weight_update = self.add_noise(weight_update)  # reuse same scale=0.1
 
         return weight_update
 
@@ -182,13 +200,17 @@ class MaliciousClient(Client):
 # =========================
 
     def add_noise(self, weight_update, scale=0.1):
+        """Absolute additive Gaussian noise (scale=0.1 by default).
 
+        Used by:
+        - attack_type=="noise"               : standalone noise attack
+        - attack_type=="noise_label_flipping": flip + noise → high MD
+        - attack_type=="noise_backdoor"      : backdoor + noise → high MD
+        """
         noisy_update = {}
-
         for k, v in weight_update.items():
             noise = torch.randn_like(v) * scale
             noisy_update[k] = v + noise
-
         return noisy_update
 
 

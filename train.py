@@ -151,7 +151,8 @@ def get_args():
     parser.add_argument("--save-every", type=int, default=10,
                         help="Save checkpoint every N rounds")
     parser.add_argument("--attack-type", type=str, default="label_flipping",
-                        choices=["label_flipping", "backdoor", "noise"])
+                        choices=["label_flipping", "backdoor", "noise",
+                                 "noise_label_flipping", "noise_backdoor"])
     parser.add_argument("--num-clients", "-n", type=int, default=100)
     parser.add_argument("--malicious-ratio", type=float, default=0.3)
     parser.add_argument("--local-epoch", type=int, default=2)
