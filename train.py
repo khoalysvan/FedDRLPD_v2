@@ -559,16 +559,21 @@ if __name__ == "__main__":
                 reward_history_list.append(episode_total_reward)
 
                 # Reward log
-                _rw_arr = np.asarray(reward, dtype=np.float32)
+                _rw_arr  = np.asarray(reward, dtype=np.float32)
+                # Q-values: read-only call — không ảnh hưởng logic chọn client
+                _q_vals  = dqn._compute_q_values(current_state)   # shape [NUM_CLIENTS]
                 _per_client_lines = []
                 _ben_rewards = []
                 _mal_rewards = []
                 for cid in range(NUM_CLIENTS):
                     rw_i = float(_rw_arr[cid])
+                    q_i  = float(_q_vals[cid])
                     tag  = "[M]" if clients[cid].is_malicious else "[B]"
                     sel  = "*" if cid in selected_set else " "
                     m_i  = float(all_malicious_scores[cid])
-                    _per_client_lines.append(f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f}")
+                    _per_client_lines.append(
+                        f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f} q={q_i:+.4f}"
+                    )
                     if clients[cid].is_malicious:
                         _mal_rewards.append(rw_i)
                     else:
