@@ -592,7 +592,16 @@ if __name__ == "__main__":
                 # DQN update
                 dqn.update_transition(curr_state=current_state, action=selected_ids,
                                       reward=reward, next_state=next_state)
-                dqn_loss = dqn.train(batch_size=DQN_BATCH_SIZE)
+                # Từ round 100+: huấn luyện DQN 10 lần mỗi round FL
+                # để Q-network học nhanh hơn khi replay buffer đã đủ đa dạng.
+                if round_idx >= 100:
+                    dqn_loss = None
+                    for _ in range(10):
+                        loss_val = dqn.train(batch_size=DQN_BATCH_SIZE)
+                        if loss_val is not None:
+                            dqn_loss = loss_val
+                else:
+                    dqn_loss = dqn.train(batch_size=DQN_BATCH_SIZE)
 
                 # TensorBoard
                 writer.add_scalar("FL/global_accuracy",        global_acc,           round_idx)
