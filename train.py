@@ -62,7 +62,7 @@ def transform_updates_with_pca(delta_updates, pca_model, output_dim):
 
 def save_checkpoint(path, round_idx, server, dqn, client_manager,
                     prev_acc, prev_rewards, current_state, reward_history_list,
-                    all_weights, all_data_sizes, all_malicious_scores, all_full_deltas,
+                    all_weights, all_data_sizes, all_malicious_scores,
                     pca_fitted, malicious_ids, best_acc, run_name, log_dir):
     """Luu toan bo trang thai de resume."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -76,7 +76,7 @@ def save_checkpoint(path, round_idx, server, dqn, client_manager,
         "dqn_step_count":       dqn.step_count,
         "replay_buffer":        list(dqn.memory.buffer)[-200:],  # chi luu 200 entries gan nhat
         "client_history":       client_manager.client_history,
-        "all_client_updates":   client_manager.all_client_updates,
+        "all_client_updates":   client_manager.all_client_updates,  # PCA vectors (~100 dims, compact)
         "prev_acc":             prev_acc,
         "prev_rewards":         prev_rewards,
         "current_state":        current_state,
@@ -84,9 +84,7 @@ def save_checkpoint(path, round_idx, server, dqn, client_manager,
         "all_weights":          all_weights,
         "all_data_sizes":       all_data_sizes,
         "all_malicious_scores": all_malicious_scores,
-        "all_full_deltas":      [],               # khong luu (qua lon ~800MB)
         "pca_fitted":           pca_fitted,        # PCA fitted model (quan trong)
-        # all_full_deltas KHONG luu -- qua lon (~800MB), fill lai sau vai rounds
         "malicious_ids":        sorted(malicious_ids),
         "best_acc":             best_acc,
         "run_name":             run_name,
@@ -177,7 +175,7 @@ if __name__ == "__main__":
     BATCH_SIZE   = args.batch_size
     LOCAL_EPOCH  = args.local_epoch
     MODE         = args.mode          # "feddrlpd" | "fedavg"
-    PCA_COMPONENTS        = 50
+    PCA_COMPONENTS        = 100
     REPLAY_BUFFER_CAPACITY = 300
 
     NUM_CLIENTS   = NUM_USERS
@@ -192,7 +190,6 @@ if __name__ == "__main__":
     DQN_EPSILON_MIN     = 0.02
     DQN_WARMUP_STEPS    = 50
     DQN_TARGET_UPD_STEP = 10
-    PCA_WARMUP_ROUNDS   = 10
 
     # -- ATTACKER CONFIG -----------------------------------------------------
     MALICIOUS_RATIO = args.malicious_ratio
@@ -267,7 +264,6 @@ if __name__ == "__main__":
     all_weights          = [np.zeros(PCA_COMPONENTS, dtype=np.float32) for _ in range(NUM_CLIENTS)]
     all_data_sizes       = [0.0] * NUM_CLIENTS
     all_malicious_scores = [0.0] * NUM_CLIENTS
-    all_full_deltas      = [None] * NUM_CLIENTS
     pca_fitted           = None
 
     # -- TENSORBOARD ---------------------------------------------------------
@@ -322,7 +318,6 @@ if __name__ == "__main__":
             _ckpt_aw = ckpt.get("all_weights", [])
             _ckpt_ds = ckpt.get("all_data_sizes", [])
             _ckpt_ms = ckpt.get("all_malicious_scores", [])
-            _ckpt_fd = ckpt.get("all_full_deltas", [])
             if len(_ckpt_aw) == NUM_CLIENTS:
                 all_weights = _ckpt_aw
             else:
@@ -335,10 +330,6 @@ if __name__ == "__main__":
                 all_malicious_scores = _ckpt_ms
             else:
                 print(f"[WARN] all_malicious_scores size mismatch, using defaults")
-            if len(_ckpt_fd) == NUM_CLIENTS:
-                all_full_deltas = _ckpt_fd
-            else:
-                all_full_deltas = [None] * NUM_CLIENTS
 
             print(f"[RESUME] Starting from round {start_round}, best_acc={best_acc:.4f}")
         else:
@@ -412,6 +403,7 @@ if __name__ == "__main__":
                 updates_pack = client_manager.train_clients(
                     global_weights, round_idx,
                     local_epochs=LOCAL_EPOCH, selected_ids=selected_ids,
+                    pca_model=pca_fitted, pca_output_dim=PCA_COMPONENTS,
                 )
                 updates      = updates_pack["updates"]
                 selected_ids = updates_pack["selected_ids"]
@@ -467,6 +459,7 @@ if __name__ == "__main__":
                 updates_pack = client_manager.train_clients(
                     global_weights, round_idx,
                     local_epochs=LOCAL_EPOCH, selected_ids=selected_ids,
+                    pca_model=pca_fitted, pca_output_dim=PCA_COMPONENTS,
                 )
                 updates          = updates_pack["updates"]
                 selected_ids     = updates_pack["selected_ids"]
@@ -498,7 +491,8 @@ if __name__ == "__main__":
                 client_ids       = []
 
                 for u in updates:
-                    full_delta_list.append(flatten_weights(u["weights"]).astype(np.float32))
+                    # raw_delta đã được client.py flatten sẵn
+                    full_delta_list.append(u["raw_delta"].astype(np.float32))
                     data_sizes.append(float(u["data_size"]))
                     malicious_scores.append(float(u["malicious_score"]))
                     client_ids.append(int(u["client_id"]))
@@ -519,19 +513,16 @@ if __name__ == "__main__":
                     _str += f" | malicious MD: mean={np.mean(_md_mal):.2f} max={np.max(_md_mal):.2f}" if _md_mal else " | malicious MD: N/A"
                     print(_str)
 
-                for i, cid in enumerate(client_ids):
-                    all_full_deltas[cid] = full_delta_list[i]
+                # PCA fitting: fit khi đủ samples, refit nếu chưa có
+                if pca_fitted is None and len(full_delta_list) >= 2:
+                    x_bank = np.stack(full_delta_list).astype(np.float32)
+                    n_comp = min(PCA_COMPONENTS, x_bank.shape[0], x_bank.shape[1])
+                    if n_comp >= 1:
+                        pca_fitted = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
+                        pca_fitted.fit(x_bank)
+                        print(f"[PCA] Fitted at round {round_idx} ({x_bank.shape[0]} samples, {n_comp} components)")
 
-                if pca_fitted is None and round_idx >= PCA_WARMUP_ROUNDS:
-                    bank = [v for v in all_full_deltas if v is not None]
-                    if len(bank) >= PCA_COMPONENTS:
-                        x_bank = np.stack(bank).astype(np.float32)
-                        n_comp = min(PCA_COMPONENTS, x_bank.shape[0], x_bank.shape[1])
-                        if n_comp >= 1:
-                            pca_fitted = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
-                            pca_fitted.fit(x_bank)
-                            print(f"[PCA] Fitted at round {round_idx} ({x_bank.shape[0]} samples, {n_comp} components)")
-
+                # DQN state dùng PCA-reduced weights
                 if pca_fitted is not None:
                     weights_list = transform_updates_with_pca(full_delta_list, pca_fitted, PCA_COMPONENTS)
                 else:
@@ -656,7 +647,7 @@ if __name__ == "__main__":
                     os.path.join(SAVE_DIR, "best_checkpoint.pt"),
                     round_idx, server, dqn, client_manager,
                     prev_acc, prev_rewards, current_state, reward_history_list,
-                    all_weights, all_data_sizes, all_malicious_scores, all_full_deltas,
+                    all_weights, all_data_sizes, all_malicious_scores,
                     pca_fitted, malicious_ids, best_acc, run_name, log_dir,
                 )
 
@@ -666,7 +657,7 @@ if __name__ == "__main__":
                     os.path.join(SAVE_DIR, "last_checkpoint.pt"),
                     round_idx, server, dqn, client_manager,
                     prev_acc, prev_rewards, current_state, reward_history_list,
-                    all_weights, all_data_sizes, all_malicious_scores, all_full_deltas,
+                    all_weights, all_data_sizes, all_malicious_scores,
                     pca_fitted, malicious_ids, best_acc, run_name, log_dir,
                 )
 
@@ -679,7 +670,7 @@ if __name__ == "__main__":
             os.path.join(SAVE_DIR, "last_checkpoint.pt"),
             round_idx, server, dqn, client_manager,
             prev_acc, prev_rewards, current_state, reward_history_list,
-            all_weights, all_data_sizes, all_malicious_scores, all_full_deltas,
+            all_weights, all_data_sizes, all_malicious_scores,
             pca_fitted, malicious_ids, best_acc, run_name, log_dir,
         )
 

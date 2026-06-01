@@ -4,6 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 from copy import deepcopy
+from sklearn.decomposition import PCA
 
 from malicious_score import (
     flatten_weights,
@@ -228,7 +229,8 @@ class ClientManager:
         # lịch sử attacker cho toàn bộ client theo global client_id
         self.client_history = [0] * len(clients)
 
-        # Memory bank: latest flattened delta update cho TOÀN BỘ clients.
+        # Memory bank: latest PCA-reduced delta update cho TOÀN BỘ clients.
+        # Lưu PCA vectors (≤100 dims) thay vì raw flattened (~600k dims).
         # - selected round hiện tại: cập nhật vector mới
         # - không selected: giữ vector cũ
         self.all_client_updates = [None] * len(clients)
@@ -283,7 +285,9 @@ class ClientManager:
                       global_weights,
                       round_idx,
                       local_epochs=1,
-                      selected_ids=None):
+                      selected_ids=None,
+                      pca_model=None,
+                      pca_output_dim=100):
         """
         Parameters
         ----------
@@ -291,6 +295,11 @@ class ClientManager:
             Danh sách client IDs đã được chọn bởi DQN ở train.py.
             Nếu None → fallback tự chọn qua _select_clients_fallback().
             Truyền trực tiếp giúp loại bỏ monkey-patch anti-pattern (Issue #8).
+        pca_model : sklearn PCA, optional
+            PCA model đã fitted. Dùng để transform raw delta → PCA space
+            trước khi lưu vào memory bank và tính MD.
+        pca_output_dim : int
+            Số chiều output PCA (dùng cho fallback khi chưa có pca_model).
         """
 
         # ── Step 1: Broadcast global model đến TẤT CẢ clients ──
@@ -309,7 +318,7 @@ class ClientManager:
 
         # ── Step 3: Local training ──
         local_updates       = []
-        delta_weights_list  = []
+        raw_delta_list      = []    # raw flattened deltas (~600k dims)
 
         for client in selected_clients:
             delta_w = client.train(epochs=local_epochs)
@@ -321,17 +330,20 @@ class ClientManager:
                 "data_size":    len(client.dataset),
                 "is_malicious": client.is_malicious,
             })
-            delta_weights_list.append(flatten_weights(delta_w))
+            raw_delta_list.append(flatten_weights(delta_w))
 
-        # ── Step 3.5: Update all-client memory bank ──
+        # ── Step 3.5: PCA transform + update memory bank (PCA space) ──
+        pca_vectors = self._transform_to_pca(
+            raw_delta_list, pca_model, pca_output_dim
+        )
         for local_idx, cid in enumerate(selected_ids):
-            self.all_client_updates[cid] = delta_weights_list[local_idx]
+            self.all_client_updates[cid] = pca_vectors[local_idx]
 
-        # ── Step 4: Malicious scoring ──
+        # ── Step 4: Malicious scoring (trên PCA space) ──
         selected_history = [self.client_history[cid] for cid in selected_ids]
 
         malicious_scores, md_scores, att_ip = compute_malicious_scores(
-            delta_weights_list,
+            pca_vectors,              # PCA-reduced vectors cho fallback
             selected_history,
             round_idx,
             all_client_updates=self.all_client_updates,
@@ -339,12 +351,13 @@ class ClientManager:
         )
 
         # Cập nhật lịch sử attacker (chỉ với clients được chọn)
-        md_feature_dim = int(delta_weights_list[0].size) if len(delta_weights_list) > 0 else 1
+        # n_features = số chiều PCA thực tế (≤100), KHÔNG phải raw weight dim
+        pca_dim = int(pca_vectors[0].size) if len(pca_vectors) > 0 else pca_output_dim
         updated_history = update_attacker_history(
             md_scores,
             selected_history,
             threshold_mode="chi2_95",
-            n_features=md_feature_dim,
+            n_features=pca_dim,
         )
         for local_idx, cid in enumerate(selected_ids):
             self.client_history[cid] = updated_history[local_idx]
@@ -354,8 +367,48 @@ class ClientManager:
             local_updates[i]["malicious_score"] = float(malicious_scores[i])
             local_updates[i]["md_score"]         = float(md_scores[i])
             local_updates[i]["attacker_prob"]    = float(att_ip[i])
+            # Giữ raw delta để train.py dùng cho DQN state / reward
+            local_updates[i]["raw_delta"]        = raw_delta_list[i]
 
         return {
             "updates":      local_updates,
             "selected_ids": selected_ids,
         }
+
+
+    @staticmethod
+    def _transform_to_pca(raw_delta_list, pca_model, output_dim):
+        """Transform raw deltas → PCA space.
+
+        Nếu có pca_model fitted → dùng transform().
+        Nếu chưa có → fit_transform per-batch (fallback cho early rounds).
+        """
+        if len(raw_delta_list) == 0:
+            return []
+
+        x = np.stack(raw_delta_list).astype(np.float32)
+        n_samples, n_features = x.shape
+
+        if pca_model is not None:
+            # Dùng PCA model đã fitted
+            x_pca = pca_model.transform(x).astype(np.float32)
+            curr_dim = x_pca.shape[1]
+            if curr_dim < output_dim:
+                pad = np.zeros((n_samples, output_dim - curr_dim), dtype=np.float32)
+                x_pca = np.concatenate([x_pca, pad], axis=1)
+            elif curr_dim > output_dim:
+                x_pca = x_pca[:, :output_dim]
+        else:
+            # Fallback: fit_transform per-batch (early rounds)
+            max_comp = min(output_dim, n_samples, n_features)
+            if max_comp >= 1 and n_samples >= 2:
+                pca_tmp = PCA(n_components=max_comp, svd_solver="randomized",
+                              random_state=42)
+                x_pca = pca_tmp.fit_transform(x).astype(np.float32)
+            else:
+                x_pca = x[:, :max_comp].astype(np.float32)
+            if max_comp < output_dim:
+                pad = np.zeros((n_samples, output_dim - max_comp), dtype=np.float32)
+                x_pca = np.concatenate([x_pca, pad], axis=1)
+
+        return [x_pca[i] for i in range(n_samples)]

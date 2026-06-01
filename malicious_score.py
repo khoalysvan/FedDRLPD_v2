@@ -31,9 +31,10 @@ def compute_covariance(weights_list, mu):
 
     centered = weights_list - mu
 
-    cov = np.dot(centered.T, centered) / len(weights_list)
+    n = len(weights_list)
+    cov = np.dot(centered.T, centered) / max(1, n - 1)   # unbiased estimator (N-1)
 
-    # regularization — tăng lên 1e-4 để ổn định hơn với delta vector cao chiều
+    # regularization — ổn định số học cho trường hợp singular
     cov += np.eye(cov.shape[0]) * 1e-4
 
     return cov
@@ -46,14 +47,9 @@ def compute_covariance(weights_list, mu):
 def mahalanobis_distance(w, mu, cov_inv):
 
     diff = w - mu
-    return np.sqrt(diff.T @ cov_inv @ diff)
-
-
-def diagonal_mahalanobis_distance(w, mu, var, eps=1e-8):
-
-    diff = w - mu
-    # Mahalanobis với hiệp phương sai đường chéo: sqrt(sum((diff^2)/(var+eps)))
-    return np.sqrt(np.sum((diff * diff) / (var + eps)))
+    val = diff.T @ cov_inv @ diff
+    # Clamp to avoid sqrt of negative due to numerical noise
+    return np.sqrt(max(0.0, float(val)))
 
 
 # =========================
@@ -61,7 +57,11 @@ def diagonal_mahalanobis_distance(w, mu, var, eps=1e-8):
 # =========================
 
 def compute_md_scores(weights_list):
+    """Tính MD cho tất cả vectors trong weights_list.
 
+    Luôn dùng full covariance + pseudo-inverse.
+    Input phải là PCA-reduced vectors (≤100 dims).
+    """
     if len(weights_list) == 0:
         return np.array([], dtype=np.float32)
 
@@ -77,117 +77,102 @@ def compute_md_scores(weights_list):
         return np.array([0.0], dtype=np.float32)
 
     mu = compute_mean(W)
-
-    # Full covariance có độ phức tạp O(d^2); chỉ dùng khi d nhỏ.
-    use_full_cov = n_features <= 2048 and n_features <= max(64, 4 * n_samples)
+    cov = compute_covariance(W, mu)
+    cov_inv = np.linalg.pinv(cov)   # pseudo-inverse: handle singular
 
     md_scores = []
-
-    if use_full_cov:
-        cov = compute_covariance(W, mu)
-        cov_inv = np.linalg.inv(cov)
-
-        for w in W:
-            md = mahalanobis_distance(w, mu, cov_inv)
-            md_scores.append(md)
-    else:
-        # Ổn định bộ nhớ cho vector update rất lớn.
-        var = np.var(W, axis=0, dtype=np.float32)
-        for w in W:
-            md = diagonal_mahalanobis_distance(w, mu, var)
-            md_scores.append(md)
+    for w in W:
+        md = mahalanobis_distance(w, mu, cov_inv)
+        md_scores.append(md)
 
     return np.array(md_scores, dtype=np.float32)
 
 
-def _normalize_vector_dim(vec, target_dim):
+# =========================
+# Memory bank helpers
+# =========================
 
-    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
-    if arr.size == target_dim:
-        return arr
+def _build_memory_matrix_valid(all_client_updates):
+    """Build matrix chỉ từ các rows KHÁC None trong memory bank.
 
-    out = np.zeros((target_dim,), dtype=np.float32)
-    take = min(target_dim, arr.size)
-    out[:take] = arr[:take]
-    return out
-
-
-def _build_memory_matrix(all_client_updates, fallback_updates=None):
-
+    Returns
+    -------
+    W_valid : ndarray [n_valid, dim]
+        Ma trận chỉ chứa clients đã có update thật.
+    valid_ids : list[int]
+        Mapping: valid_ids[local_idx] = global client_id.
+    """
     if all_client_updates is None or len(all_client_updates) == 0:
-        if fallback_updates is None or len(fallback_updates) == 0:
-            return np.zeros((0, 0), dtype=np.float32)
-        W = np.asarray(fallback_updates, dtype=np.float32)
-        if W.ndim != 2:
-            raise ValueError("fallback_updates must be a 2D array-like [num_clients, num_features].")
-        return W
+        return np.zeros((0, 0), dtype=np.float32), []
 
-    # infer dimension from memory bank first, fallback to selected updates if needed
+    # Tìm chiều từ entry đầu tiên khác None
     dim = None
     for u in all_client_updates:
         if u is not None:
             dim = np.asarray(u, dtype=np.float32).reshape(-1).size
             break
 
-    if dim is None and fallback_updates is not None and len(fallback_updates) > 0:
-        dim = np.asarray(fallback_updates[0], dtype=np.float32).reshape(-1).size
-
     if dim is None:
-        return np.zeros((0, 0), dtype=np.float32)
+        return np.zeros((0, 0), dtype=np.float32), []
 
-    mat = np.zeros((len(all_client_updates), dim), dtype=np.float32)
+    # Chỉ lấy rows có dữ liệu thật
+    valid_rows = []
+    valid_ids = []
     for i, u in enumerate(all_client_updates):
-        if u is None:
-            continue
-        mat[i] = _normalize_vector_dim(u, dim)
+        if u is not None:
+            arr = np.asarray(u, dtype=np.float32).reshape(-1)
+            if arr.size == dim:
+                valid_rows.append(arr)
+            else:
+                # pad/truncate nếu dim mismatch
+                row = np.zeros(dim, dtype=np.float32)
+                take = min(dim, arr.size)
+                row[:take] = arr[:take]
+                valid_rows.append(row)
+            valid_ids.append(i)
 
-    return mat
+    if len(valid_rows) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    return np.stack(valid_rows).astype(np.float32), valid_ids
 
 
 def compute_md_scores_selected_from_memory(all_client_updates,
                                            selected_ids,
                                            fallback_selected_updates=None):
+    """Tính MD cho selected_ids, μ/Cov tính trên toàn bộ valid memory bank.
 
+    Pipeline: PCA vectors in memory → full cov → MD per selected client.
+    Chỉ dùng rows khác None để tính μ, Cov (fix Bug B2).
+    """
     if selected_ids is None or len(selected_ids) == 0:
         return np.array([], dtype=np.float32)
 
     selected_ids = [int(cid) for cid in selected_ids]
-    W_all = _build_memory_matrix(all_client_updates, fallback_updates=fallback_selected_updates)
 
-    if W_all.size == 0:
+    W_valid, valid_ids = _build_memory_matrix_valid(all_client_updates)
+
+    if W_valid.size == 0 or len(valid_ids) < 2:
         return np.zeros((len(selected_ids),), dtype=np.float32)
 
-    if W_all.ndim != 2:
-        raise ValueError("all_client_updates memory matrix must be 2D.")
+    n_valid, n_features = W_valid.shape
 
-    n_samples, n_features = W_all.shape
-    if n_samples == 1:
-        return np.zeros((len(selected_ids),), dtype=np.float32)
+    # μ, Cov tính trên TẤT CẢ valid clients (không chỉ selected)
+    mu = compute_mean(W_valid)
+    cov = compute_covariance(W_valid, mu)
+    cov_inv = np.linalg.pinv(cov)   # pseudo-inverse: handle singular
 
-    # μ = mean(all_client_updates)
-    mu = compute_mean(W_all)
-
-    # Cov = covariance(all_client_updates) with numerical stability
-    use_full_cov = n_features <= 2048 and n_features <= max(64, 4 * n_samples)
+    # Build lookup: global_id → vector
+    id_to_idx = {gid: idx for idx, gid in enumerate(valid_ids)}
 
     md_scores = []
-    if use_full_cov:
-        cov = compute_covariance(W_all, mu)  # includes +I*1e-4
-        cov_inv = np.linalg.inv(cov)
-
-        for cid in selected_ids:
-            if cid < 0 or cid >= n_samples:
-                md_scores.append(0.0)
-                continue
-            md_scores.append(mahalanobis_distance(W_all[cid], mu, cov_inv))
-    else:
-        # fallback đường chéo cho chiều lớn
-        var = np.var(W_all, axis=0, dtype=np.float32)
-        for cid in selected_ids:
-            if cid < 0 or cid >= n_samples:
-                md_scores.append(0.0)
-                continue
-            md_scores.append(diagonal_mahalanobis_distance(W_all[cid], mu, var))
+    for cid in selected_ids:
+        if cid in id_to_idx:
+            w = W_valid[id_to_idx[cid]]
+            md_scores.append(mahalanobis_distance(w, mu, cov_inv))
+        else:
+            # Client chưa có trong memory bank → MD = 0
+            md_scores.append(0.0)
 
     return np.asarray(md_scores, dtype=np.float32)
 
@@ -220,8 +205,8 @@ def compute_malicious_scores(weights_list,
                              round_idx,
                              all_client_updates=None,
                              selected_ids=None):
-    # New FedDRLPD interpretation:
-    # - μ, Cov tính trên toàn bộ memory bank all_client_updates
+    # Pipeline PCA-reduced:
+    # - μ, Cov tính trên toàn bộ valid entries trong memory bank (PCA space)
     # - MD chỉ tính cho selected_ids round hiện tại
     # Backward-compatible fallback: nếu không có memory bank thì dùng cách cũ.
     if all_client_updates is not None and selected_ids is not None:
