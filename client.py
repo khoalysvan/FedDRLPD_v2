@@ -351,12 +351,13 @@ class ClientManager:
         )
 
         # Cập nhật lịch sử attacker (chỉ với clients được chọn)
-        # n_features = số chiều PCA thực tế (≤100), KHÔNG phải raw weight dim
+        # threshold_mode="mean": client nào có MD > mean MD round này → tăng history
+        # Att_ip tích lũy dần → malicious clients bị phạt nặng hơn theo thời gian
         pca_dim = int(pca_vectors[0].size) if len(pca_vectors) > 0 else pca_output_dim
         updated_history = update_attacker_history(
             md_scores,
             selected_history,
-            threshold_mode="chi2_95",
+            threshold_mode="mean",
             n_features=pca_dim,
         )
         for local_idx, cid in enumerate(selected_ids):

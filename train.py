@@ -244,7 +244,7 @@ if __name__ == "__main__":
     # -- DQN -----------------------------------------------------------------
     client_state_dim = PCA_COMPONENTS + 3
     dqn = DQNAgent(
-        state_dim=client_state_dim, num_clients=NUM_CLIENTS, select_ratio=0.3,
+        state_dim=client_state_dim, num_clients=NUM_CLIENTS, select_ratio=0.7,
         device=DQN_DEVICE, gamma=DQN_GAMMA, epsilon=DQN_EPSILON_START,
         replay_capacity=REPLAY_BUFFER_CAPACITY, update_target_steps=DQN_TARGET_UPD_STEP,
         epsilon_decay=DQN_EPSILON_DECAY, epsilon_min=DQN_EPSILON_MIN,
@@ -264,6 +264,7 @@ if __name__ == "__main__":
     all_weights          = [np.zeros(PCA_COMPONENTS, dtype=np.float32) for _ in range(NUM_CLIENTS)]
     all_data_sizes       = [0.0] * NUM_CLIENTS
     all_malicious_scores = [0.0] * NUM_CLIENTS
+    all_md_scores        = [0.0] * NUM_CLIENTS   # raw MD (trước nhân Att_ip)
     pca_fitted           = None
 
     # -- TENSORBOARD ---------------------------------------------------------
@@ -532,6 +533,7 @@ if __name__ == "__main__":
                     all_weights[cid]          = weights_list[i]
                     all_data_sizes[cid]       = data_sizes[i]
                     all_malicious_scores[cid] = malicious_scores[i]
+                    all_md_scores[cid]        = float(updates[i]["md_score"])
 
                 next_state = dqn.build_state(
                     all_weights, all_data_sizes, all_malicious_scores, global_acc,
@@ -562,8 +564,9 @@ if __name__ == "__main__":
                     tag  = "[M]" if clients[cid].is_malicious else "[B]"
                     sel  = "*" if cid in selected_set else " "
                     m_i  = float(all_malicious_scores[cid])
+                    md_i = float(all_md_scores[cid])
                     _per_client_lines.append(
-                        f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f} q={q_i:+.4f}"
+                        f"  C{cid:02d} {tag}{sel} rw={rw_i:+.4f} m={m_i:.3f} md={md_i:.3f} q={q_i:+.4f}"
                     )
                     if clients[cid].is_malicious:
                         _mal_rewards.append(rw_i)
