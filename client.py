@@ -112,8 +112,11 @@ class MaliciousClient(Client):
                  batch_size=32):
 
         super().__init__(client_id, dataset, model, device, batch_size=batch_size)
-        self.attack_type = attack_type
+        self.attack_type  = attack_type
         self.is_malicious = True
+        # Mỗi malicious client có target label khác nhau (phân tán hướng tấn công)
+        # client_id % 10 đảm bảo 10 class CIFAR-10 đều có thể là target
+        self.target_label = client_id % 10
 
 
 # =========================
@@ -126,8 +129,15 @@ class MaliciousClient(Client):
             labels = (labels + 1) % 10
 
         elif self.attack_type == "backdoor":
-            images = self.add_trigger(images)
-            labels[:] = 0  # target label
+            # Partial backdoor: chỉ poison 50% batch — 50% còn lại train sạch
+            # → giữ được accuracy task chính, update trông "bình thường" hơn
+            n = images.size(0)
+            n_poison = max(1, n // 2)   # 50%
+            idx = torch.randperm(n, device=images.device)[:n_poison]
+            images = images.clone()
+            images[idx] = self.add_trigger(images[idx])
+            labels = labels.clone()
+            labels[idx] = self.target_label   # mỗi client có target label riêng
 
         # --- Combined attacks: poisoning + large weight noise ---
         # Goal: push weight delta further from benign distribution
@@ -137,8 +147,13 @@ class MaliciousClient(Client):
             # weight noise is injected in train() after computing the delta
 
         elif self.attack_type == "noise_backdoor":
-            images = self.add_trigger(images)  # backdoor trigger
-            labels[:] = 0                      # target label
+            n = images.size(0)
+            n_poison = max(1, n // 2)
+            idx = torch.randperm(n, device=images.device)[:n_poison]
+            images = images.clone()
+            images[idx] = self.add_trigger(images[idx])
+            labels = labels.clone()
+            labels[idx] = self.target_label
             # weight noise is injected in train() after computing the delta
 
         return images, labels
