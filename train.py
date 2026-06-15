@@ -267,6 +267,9 @@ if __name__ == "__main__":
     all_md_scores        = [0.0] * NUM_CLIENTS   # raw MD (trước nhân Att_ip)
     pca_fitted           = None
 
+    # Lưu métrics round cuối (hoặc round bị Ctrl+C) để xuất CSV sau
+    last_round_metrics: dict = {}
+
     # -- TENSORBOARD ---------------------------------------------------------
     run_name = (
         f"{MODE}_{DATASET}_N{NUM_CLIENTS}_"
@@ -485,6 +488,23 @@ if __name__ == "__main__":
                 tpr = detected_mal / max(1, num_malicious)
                 fpr = false_excl   / max(1, NUM_CLIENTS - num_malicious)
 
+                # Cập nhật métrics round hiện tại (ghi đè mỗi round, giữ lại round cuối)
+                last_round_metrics = {
+                    "round":        round_idx,
+                    "attack_type":  ATTACK_TYPE,
+                    "tp":           detected_mal,
+                    "tn":           len(ben_selected),
+                    "fp":           false_excl,
+                    "fn":           missed_mal,
+                    "tpr":          round(tpr, 4),
+                    "fpr":          round(fpr, 4),
+                    "accuracy":     round(global_acc, 4),
+                    "loss":         round(global_loss, 4),
+                    "mal_in_sel":   len(mal_selected),
+                    "num_malicious": num_malicious,
+                    "num_benign":   NUM_CLIENTS - num_malicious,
+                }
+
                 # Build next state
                 full_delta_list  = []
                 data_sizes       = []
@@ -682,6 +702,18 @@ if __name__ == "__main__":
         except Exception:
             pass
         writer.close()
+
+        # Xuất metrics round cuối ra CSV
+        if last_round_metrics:
+            import csv, os as _os
+            csv_path = _os.path.join(SAVE_DIR, "final_metrics.csv")
+            write_header = not _os.path.isfile(csv_path)
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(last_round_metrics.keys()))
+                if write_header:
+                    w.writeheader()
+                w.writerow(last_round_metrics)
+            print(f"[CSV] Final metrics saved → {csv_path}")
 
         print(f"\n=== Training Finished ===")
         print(f"Last round:     {round_idx}")
