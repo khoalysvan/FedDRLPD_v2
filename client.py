@@ -377,7 +377,7 @@ class ClientManager:
         #                       threshold_mode="median",   n_features=pca_dim)
         # updated_history = update_attacker_history(md_scores, selected_history,
         #                       threshold_mode="chi2_95",  n_features=pca_dim)
-        M_THR = 7.8   # ngưỡng cho malicious
+        M_THR = 7.5   # ngưỡng cho malicious
         B_THR = 8.5   # ngưỡng cho benign
         for local_idx, cid in enumerate(selected_ids):
             md_val = float(md_scores[local_idx])
