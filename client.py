@@ -365,18 +365,26 @@ class ClientManager:
             selected_ids=selected_ids,
         )
 
-        # Cập nhật lịch sử attacker (chỉ với clients được chọn)
-        # threshold_mode="mean": client nào có MD > mean MD round này → tăng history
-        # Att_ip tích lũy dần → malicious clients bị phạt nặng hơn theo thời gian
-        pca_dim = int(pca_vectors[0].size) if len(pca_vectors) > 0 else pca_output_dim
-        updated_history = update_attacker_history(
-            md_scores,
-            selected_history,
-            threshold_mode="mean",
-            n_features=pca_dim,
-        )
+        # Cập nhật lịch sử attacker — Dual-threshold:
+        #   Malicious client: MD >= 7.8 → history += 1  (ngưỡng thấp hơn, bắt nhiều attacker hơn)
+        #   Benign   client : MD >= 8.5 → history += 1  (ngưỡng cao hơn, giảm false alarm)
+        #   Còn lại         : history += 0 (giữ nguyên)
+        # Các chế độ cũ (comment để tham khảo):
+        # pca_dim = int(pca_vectors[0].size) if len(pca_vectors) > 0 else pca_output_dim
+        # updated_history = update_attacker_history(md_scores, selected_history,
+        #                       threshold_mode="mean",     n_features=pca_dim)
+        # updated_history = update_attacker_history(md_scores, selected_history,
+        #                       threshold_mode="median",   n_features=pca_dim)
+        # updated_history = update_attacker_history(md_scores, selected_history,
+        #                       threshold_mode="chi2_95",  n_features=pca_dim)
+        M_THR = 7.8   # ngưỡng cho malicious
+        B_THR = 8.5   # ngưỡng cho benign
         for local_idx, cid in enumerate(selected_ids):
-            self.client_history[cid] = updated_history[local_idx]
+            md_val = float(md_scores[local_idx])
+            thr    = M_THR if self.clients[cid].is_malicious else B_THR
+            if md_val >= thr:
+                self.client_history[cid] += 1
+            # else: += 0, không thay đổi
 
         # Gắn scores vào từng update dict
         for i in range(len(local_updates)):
